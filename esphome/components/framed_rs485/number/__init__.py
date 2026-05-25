@@ -3,9 +3,11 @@ from esphome.components import number
 import esphome.config_validation as cv
 from esphome.const import CONF_LAMBDA, CONF_MAX_VALUE, CONF_MIN_VALUE, CONF_STEP
 
-from .. import CONF_FRAMED_RS485_ID, FramedRS485Hub, FramedRS485Number
+from .. import CONF_FRAMED_RS485_ID, FramedRS485Hub, framed_rs485_ns
 
 AUTO_LOAD = ["framed_rs485"]
+
+FramedRS485Number = framed_rs485_ns.class_("FramedRS485Number", number.Number)
 
 CONFIG_SCHEMA = number.number_schema(FramedRS485Number).extend(
     {
@@ -19,18 +21,18 @@ CONFIG_SCHEMA = number.number_schema(FramedRS485Number).extend(
 
 
 async def to_code(config):
+    hub = await cg.get_variable(config[CONF_FRAMED_RS485_ID])
     var = await number.new_number(
         config,
+        hub,
         min_value=config[CONF_MIN_VALUE],
         max_value=config[CONF_MAX_VALUE],
         step=config[CONF_STEP],
     )
-    hub = await cg.get_variable(config[CONF_FRAMED_RS485_ID])
-    cg.add(var.set_parent(hub))
 
     template_ = await cg.process_lambda(
         config[CONF_LAMBDA],
-        [("float", "x")],
+        [(cg.float_, "x")],
         return_type=cg.optional.template(cg.std_vector.template(cg.uint8)),
     )
     cg.add(var.set_template(template_))

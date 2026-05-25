@@ -2,6 +2,36 @@ framed_rs485:
   - id: framed_rs485_hub
     uart_id: uart_bus
     profile: generic_framed_rs485
+    dump_frames: true
+    frame_timeout: 50ms
+
+  # Second instance: sniffer-only with idle_gap gate and CRC16-Modbus
+  - id: framed_rs485_hub2
+    uart_id: uart_bus
+    profile: generic_framed_rs485
+    sniffer_only: true
+    crc:
+      type: crc16_modbus
+      rx_accept: [header_inclusive, payload_only]
+      tx_variant: header_inclusive
+    tx:
+      gate:
+        mode: idle_gap
+        min_silence: 10ms
+      tx_guard_time: 5ms
+      queue_policy: fifo
+      max_queue_size: 4
+
+  # Third instance: fixed_delay gate with XOR8 CRC
+  - id: framed_rs485_hub3
+    uart_id: uart_bus
+    profile: generic_framed_rs485
+    crc:
+      type: xor8
+    tx:
+      gate:
+        mode: fixed_delay
+        interval: 500ms
 
 binary_sensor:
   - platform: framed_rs485
@@ -20,12 +50,36 @@ binary_sensor:
     match_off: ["Heater", "Manual"]
     timeout: 60s
 
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Custom Flag"
+    frame_type: [0x12, 0x34]
+    lambda: |-
+      if (payload.size() < 3) return {};
+      return bool(payload[2] & 0x01);
+
 sensor:
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
     name: "Pool Temp"
     frame_type: [0x01, 0x03]
     decode: display_temperature
+    temperature_label: pool
+
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "CRC Failures"
+    frame_type: []
+    decode: crc_failures
+    entity_category: diagnostic
+    accuracy_decimals: 0
+
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Queue Depth"
+    frame_type: []
+    decode: queue_depth
+    entity_category: diagnostic
 
 text_sensor:
   - platform: framed_rs485
@@ -39,6 +93,13 @@ text_sensor:
     name: "Display Blink"
     frame_type: [0x01, 0x03]
     decode: display_blink_text
+
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Last Frame Type"
+    frame_type: []
+    decode: last_frame_type
+    entity_category: diagnostic
 
 button:
   - platform: framed_rs485

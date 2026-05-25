@@ -1,6 +1,7 @@
 from esphome import pins
 import esphome.codegen as cg
-from esphome.components import binary_sensor, button, number, sensor, text_sensor, uart
+from esphome.components import uart
+from esphome.components.const import CONF_DATA_BITS, CONF_PARITY, CONF_STOP_BITS
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_BAUD_RATE,
@@ -21,15 +22,6 @@ MULTI_CONF = True
 
 framed_rs485_ns = cg.esphome_ns.namespace("framed_rs485")
 FramedRS485Hub = framed_rs485_ns.class_("FramedRS485Hub", cg.Component, uart.UARTDevice)
-FramedRS485BinarySensor = framed_rs485_ns.class_(
-    "FramedRS485BinarySensor", binary_sensor.BinarySensor
-)
-FramedRS485Button = framed_rs485_ns.class_("FramedRS485Button", button.Button)
-FramedRS485Sensor = framed_rs485_ns.class_("FramedRS485Sensor", sensor.Sensor)
-FramedRS485Number = framed_rs485_ns.class_("FramedRS485Number", number.Number)
-FramedRS485TextSensor = framed_rs485_ns.class_(
-    "FramedRS485TextSensor", text_sensor.TextSensor
-)
 
 SensorDecode = framed_rs485_ns.enum("SensorDecode")
 BinaryDecode = framed_rs485_ns.enum("BinaryDecode")
@@ -48,6 +40,7 @@ CONF_DLE = "dle"
 CONF_DUMP_FRAMES = "dump_frames"
 CONF_ESCAPE_BYTE = "escape_byte"
 CONF_ETX = "etx"
+CONF_FRAME_TIMEOUT = "frame_timeout"
 CONF_FRAME_TYPE = "frame_type"
 CONF_FRAMING = "framing"
 CONF_GATE = "gate"
@@ -68,23 +61,11 @@ CONF_TX = "tx"
 CONF_TX_GUARD_TIME = "tx_guard_time"
 CONF_TX_VARIANT = "tx_variant"
 
-# These match esphome/components/uart/__init__.py key strings.
-CONF_DATA_BITS = "data_bits"
-CONF_PARITY = "parity"
-CONF_STOP_BITS = "stop_bits"
-
 PROFILE_HAYWARD_WIRELESS = "hayward_aqualogic_wireless"
 PROFILE_HAYWARD_WIRED_REMOTE = "hayward_aqualogic_wired_remote"
 PROFILE_HAYWARD_WIRED_LOCAL = "hayward_aqualogic_wired_local"
 PROFILE_JANDY_RS = "jandy_aqualink_rs"
 PROFILE_GENERIC = "generic_framed_rs485"
-
-# ESPHome UART component defaults (used in final validation fallback).
-_UART_DEFAULTS = {
-    CONF_DATA_BITS: 8,
-    CONF_PARITY: "NONE",
-    CONF_STOP_BITS: 1,
-}
 
 KEY_FORMATS = {
     "wireless_9byte": KeyFormat.KEY_FORMAT_WIRELESS_9BYTE,
@@ -291,6 +272,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_DUMP_FRAMES, default=False): cv.boolean,
             cv.Optional(CONF_SNIFFER_ONLY, default=False): cv.boolean,
             cv.Optional(CONF_MAX_FRAME_LENGTH, default=128): cv.positive_int,
+            cv.Optional(
+                CONF_FRAME_TIMEOUT, default="50ms"
+            ): cv.positive_time_period_milliseconds,
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
@@ -316,8 +300,8 @@ def _final_validate(config):
             CONF_STOP_BITS: 1,
         }
         for key, expected in required.items():
-            actual = uart_config.get(key, _UART_DEFAULTS.get(key))
-            if actual != expected:
+            # UART schema always provides validated defaults, so direct access is safe.
+            if uart_config[key] != expected:
                 raise cv.Invalid(
                     f"Framed RS-485 jandy_aqualink_rs profile requires uart {key}: {expected}; "
                     f"use profile: {PROFILE_GENERIC} for other serial settings"
@@ -331,8 +315,7 @@ def _final_validate(config):
         CONF_STOP_BITS: 2,
     }
     for key, expected in required.items():
-        actual = uart_config.get(key, _UART_DEFAULTS.get(key))
-        if actual != expected:
+        if uart_config[key] != expected:
             raise cv.Invalid(
                 f"Framed RS-485 Hayward profiles require uart {key}: {expected}; "
                 f"use profile: {PROFILE_GENERIC} for other serial settings"
@@ -388,6 +371,7 @@ async def to_code(config):
     cg.add(var.set_dump_frames(config[CONF_DUMP_FRAMES]))
     cg.add(var.set_sniffer_only(config[CONF_SNIFFER_ONLY]))
     cg.add(var.set_max_frame_length(config[CONF_MAX_FRAME_LENGTH]))
+    cg.add(var.set_in_frame_timeout(config[CONF_FRAME_TIMEOUT].total_milliseconds))
 
     if (flow_pin_cfg := config.get(CONF_FLOW_CONTROL_PIN)) is not None:
         pin = await cg.gpio_pin_expression(flow_pin_cfg)

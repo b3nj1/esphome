@@ -9,13 +9,16 @@ from .. import (
     CONF_FRAMED_RS485_ID,
     TEXT_DECODES,
     FramedRS485Hub,
-    FramedRS485TextSensor,
+    framed_rs485_ns,
     setup_listener,
     validate_frame_type,
 )
 
 AUTO_LOAD = ["framed_rs485"]
 
+FramedRS485TextSensor = framed_rs485_ns.class_(
+    "FramedRS485TextSensor", text_sensor.TextSensor
+)
 
 CONFIG_SCHEMA = text_sensor.text_sensor_schema(FramedRS485TextSensor).extend(
     {

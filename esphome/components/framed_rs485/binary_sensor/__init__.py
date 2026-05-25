@@ -11,13 +11,17 @@ from .. import (
     CONF_FRAMED_RS485_ID,
     CONF_MATCH_OFF,
     CONF_MATCH_ON,
-    FramedRS485BinarySensor,
     FramedRS485Hub,
+    framed_rs485_ns,
     setup_listener,
     validate_frame_type,
 )
 
 AUTO_LOAD = ["framed_rs485"]
+
+FramedRS485BinarySensor = framed_rs485_ns.class_(
+    "FramedRS485BinarySensor", binary_sensor.BinarySensor
+)
 
 
 def _validate_binary_sensor(config):

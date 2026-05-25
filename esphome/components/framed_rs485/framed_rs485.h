@@ -4,95 +4,81 @@
 #include "esphome/core/gpio.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
-#ifdef USE_BINARY_SENSOR
-#include "esphome/components/binary_sensor/binary_sensor.h"
-#endif
-#ifdef USE_BUTTON
-#include "esphome/components/button/button.h"
-#endif
-#ifdef USE_NUMBER
-#include "esphome/components/number/number.h"
-#endif
-#ifdef USE_SENSOR
-#include "esphome/components/sensor/sensor.h"
-#endif
-#ifdef USE_TEXT_SENSOR
-#include "esphome/components/text_sensor/text_sensor.h"
-#endif
 #include "esphome/components/uart/uart.h"
 
-#include <functional>
 #include <string>
-#include <utility>
 #include <vector>
 
-namespace esphome {
-namespace framed_rs485 {
+namespace esphome::framed_rs485 {
 
+/// Built-in decode modes for the sensor platform.
 enum SensorDecode {
-  SENSOR_DECODE_LED_MASK,
-  SENSOR_DECODE_LED_MASK_BLINKING,
-  SENSOR_DECODE_DISPLAY_TEMPERATURE,
-  SENSOR_DECODE_UINT8,
-  SENSOR_DECODE_UINT16_BE,
-  SENSOR_DECODE_UINT16_LE,
-  SENSOR_DECODE_UINT32_BE,
-  SENSOR_DECODE_UINT32_LE,
-  SENSOR_DECODE_BCD,
-  SENSOR_DECODE_VSP_SPEED_REQUEST,
-  SENSOR_DECODE_VSP_POWER_BCD,
-  SENSOR_DECODE_FRAMES_RECEIVED,
-  SENSOR_DECODE_CRC_FAILURES,
-  SENSOR_DECODE_COMMANDS_SENT,
-  SENSOR_DECODE_COMMAND_DROPS,
-  SENSOR_DECODE_LAST_KEEPALIVE_MS,
-  SENSOR_DECODE_QUEUE_DEPTH,
+  SENSOR_DECODE_LED_MASK,             ///< Current LED bitmask as a 32-bit float (AquaLogic frame 0x0102).
+  SENSOR_DECODE_LED_MASK_BLINKING,    ///< Blinking LED bitmask as a 32-bit float (AquaLogic frame 0x0102).
+  SENSOR_DECODE_DISPLAY_TEMPERATURE,  ///< Temperature digit nearest the configured label in display text.
+  SENSOR_DECODE_UINT8,                ///< Unsigned byte at the configured offset.
+  SENSOR_DECODE_UINT16_BE,            ///< Unsigned 16-bit big-endian at the configured offset.
+  SENSOR_DECODE_UINT16_LE,            ///< Unsigned 16-bit little-endian at the configured offset.
+  SENSOR_DECODE_UINT32_BE,            ///< Unsigned 32-bit big-endian at the configured offset.
+  SENSOR_DECODE_UINT32_LE,            ///< Unsigned 32-bit little-endian at the configured offset.
+  SENSOR_DECODE_BCD,                  ///< Packed BCD byte at the configured offset.
+  SENSOR_DECODE_VSP_SPEED_REQUEST,    ///< Hayward VSP commanded speed % (frame 0x0C01, bytes 2-3).
+  SENSOR_DECODE_VSP_POWER_BCD,        ///< Hayward VSP power in watts, BCD encoded (frame 0x000C, bytes 5-6).
+  SENSOR_DECODE_FRAMES_RECEIVED,      ///< Diagnostic: running count of validated RX frames.
+  SENSOR_DECODE_CRC_FAILURES,         ///< Diagnostic: running count of CRC-failed frames.
+  SENSOR_DECODE_COMMANDS_SENT,        ///< Diagnostic: running count of transmitted frames.
+  SENSOR_DECODE_COMMAND_DROPS,        ///< Diagnostic: commands dropped (queue full or sniffer mode).
+  SENSOR_DECODE_LAST_KEEPALIVE_MS,    ///< Diagnostic: interval (ms) between the last two gate frames.
+  SENSOR_DECODE_QUEUE_DEPTH,          ///< Diagnostic: current TX queue depth.
 };
 
+/// Built-in decode modes for the binary_sensor platform.
 enum BinaryDecode {
-  BINARY_DECODE_LED_BIT,
-  // True when the decoded display text (high-bit-stripped, trimmed) contains
-  // the configured match string (case-insensitive substring).
-  BINARY_DECODE_DISPLAY_TEXT_MATCH,
+  BINARY_DECODE_LED_BIT,             ///< True when a specific bit of the 32-bit LED mask is set.
+  BINARY_DECODE_DISPLAY_TEXT_MATCH,  ///< Latching case-insensitive substring match against decoded display text.
 };
 
+/// Built-in decode modes for the text_sensor platform.
 enum TextDecode {
-  TEXT_DECODE_DISPLAY_TEXT,
-  TEXT_DECODE_LAST_FRAME_TYPE,
-  // Returns only the characters that have their high bit set in the raw frame
-  // (blinking characters on an AquaLogic display). Empty string when nothing blinks.
-  TEXT_DECODE_DISPLAY_BLINK_TEXT,
+  TEXT_DECODE_DISPLAY_TEXT,        ///< Full display text with degree-sign substitution and whitespace trimmed.
+  TEXT_DECODE_DISPLAY_BLINK_TEXT,  ///< Only the characters actively blinking (high bit set) on the display.
+  TEXT_DECODE_LAST_FRAME_TYPE,     ///< Hex string of the two-byte type of the most recently received frame.
 };
 
+/// Key-frame format used when encoding button commands for TX.
 enum KeyFormat {
-  KEY_FORMAT_WIRELESS_9BYTE,
-  KEY_FORMAT_WIRED_REMOTE,
-  KEY_FORMAT_WIRED_LOCAL,
-  KEY_FORMAT_JANDY_ALLBUTTON,
+  KEY_FORMAT_WIRELESS_9BYTE,   ///< Hayward AquaLogic wireless remote (frame type 0x0083, 9-byte payload).
+  KEY_FORMAT_WIRED_REMOTE,     ///< Hayward AquaLogic wired remote.
+  KEY_FORMAT_WIRED_LOCAL,      ///< Hayward AquaLogic local wired controller.
+  KEY_FORMAT_JANDY_ALLBUTTON,  ///< Jandy AquaLink RS AllButton frame.
 };
 
+/// Which bytes are included in the CRC calculation.
 enum CrcVariant {
-  CRC_HEADER_INCLUSIVE,
-  CRC_PAYLOAD_ONLY,
+  CRC_HEADER_INCLUSIVE,  ///< DLE+STX preamble bytes are included in the CRC sum (Hayward wireless).
+  CRC_PAYLOAD_ONLY,      ///< CRC covers only the unescaped payload bytes (Hayward wired remotes).
 };
 
+/// CRC algorithm applied to each frame.
 enum CrcType {
-  CRC_TYPE_NONE,
-  CRC_TYPE_SUM8,
-  CRC_TYPE_SUM16,
-  CRC_TYPE_XOR8,
-  CRC_TYPE_CRC16_MODBUS,
+  CRC_TYPE_NONE,          ///< No CRC — every structurally valid frame is accepted.
+  CRC_TYPE_SUM8,          ///< 8-bit arithmetic sum.
+  CRC_TYPE_SUM16,         ///< 16-bit arithmetic sum.
+  CRC_TYPE_XOR8,          ///< 8-bit XOR.
+  CRC_TYPE_CRC16_MODBUS,  ///< CRC-16/MODBUS (poly 0xA001, init 0xFFFF, little-endian output).
 };
 
+/// TX queue overflow strategy.
 enum QueuePolicy {
-  QUEUE_REPLACE_LATEST,
-  QUEUE_FIFO,
+  QUEUE_REPLACE_LATEST,  ///< New command replaces the pending command (max_queue_size must be 1).
+  QUEUE_FIFO,            ///< Commands are transmitted in arrival order.
 };
 
+/// TX gate trigger mode — controls when queued commands are transmitted.
 enum TxGateMode {
-  TX_GATE_FRAME_TRIGGER,
-  TX_GATE_IDLE_GAP,
-  TX_GATE_FIXED_DELAY,
+  TX_GATE_FRAME_TRIGGER,  ///< Transmit after receiving a specific gate frame type.
+  TX_GATE_IDLE_GAP,       ///< Transmit after the bus has been silent for min_silence.
+  TX_GATE_FIXED_DELAY,    ///< Transmit on a fixed periodic interval.
 };
 
 class FramedRS485Hub;
@@ -100,7 +86,6 @@ class FramedRS485Hub;
 class FramedRS485Listener {
  public:
   void set_frame_type(const std::vector<uint8_t> &frame_type) { this->frame_type_ = frame_type; }
-
   bool matches(const std::vector<uint8_t> &payload) const;
   virtual void handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) = 0;
 
@@ -137,6 +122,7 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   void set_sniffer_only(bool sniffer_only) { this->sniffer_only_ = sniffer_only; }
   void set_max_frame_length(uint32_t length) { this->max_frame_length_ = length; }
   void set_flow_control_pin(GPIOPin *pin) { this->flow_control_pin_ = pin; }
+  void set_in_frame_timeout(uint32_t ms) { this->in_frame_timeout_ms_ = ms; }
 
   bool queue_command_value(uint32_t command);
   bool queue_raw_frame(const std::vector<uint8_t> &payload);
@@ -147,18 +133,20 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   uint32_t get_commands_sent() const { return this->commands_sent_; }
   uint32_t get_command_drops() const { return this->command_drops_; }
   uint32_t get_last_keepalive_ms() const { return this->last_keepalive_ms_; }
-  uint32_t get_queue_depth() const { return this->tx_queue_.size() + (this->tx_start_pending_ ? 1 : 0); }
-  const std::string &get_last_frame_type() const { return this->last_frame_type_; }
+  uint32_t get_queue_depth() const {
+    return (this->tx_queue_.size() - this->tx_queue_head_) + (this->tx_start_pending_ ? 1 : 0);
+  }
+  const char *get_last_frame_type() const { return this->last_frame_type_; }
 
+  // Hayward AquaLogic protocol helpers — included for convenience.
+  // These operate on the LED status frame (type 0x0102) and display frame (type 0x0103).
   static uint32_t decode_led_mask(const std::vector<uint8_t> &payload);
   static uint32_t decode_led_mask_blinking(const std::vector<uint8_t> &payload);
-  // Strips the high bit from each byte, substitutes '_' with degree sign, trims whitespace.
+  /// Strips blink bits, substitutes degree sign, and trims whitespace from a display payload.
   static void decode_display_text(const std::vector<uint8_t> &payload, std::string &out);
-  // Returns only the characters whose high bit was set in the raw frame (blinking chars).
-  // Produces an empty string when nothing is blinking.
+  /// Returns only the characters with bit 7 set (blinking glyphs); empty when nothing blinks.
   static void decode_display_blink_text(const std::vector<uint8_t> &payload, std::string &out);
-  // Collapses runs of whitespace to a single space and trims ends. Used before
-  // display_text_match comparisons to absorb display centering padding.
+  /// Collapses whitespace runs to a single space and trims ends (display centering absorption).
   static std::string normalize_display_ws(const std::string &s);
 
  protected:
@@ -177,6 +165,8 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   void release_tx_();
   bool frame_type_equals_(const std::vector<uint8_t> &payload, const std::vector<uint8_t> &frame_type) const;
   void update_last_frame_type_();
+  size_t queue_size_() const { return this->tx_queue_.size() - this->tx_queue_head_; }
+  void queue_pop_front_();
 
   uint8_t dle_{0x10};
   uint8_t stx_{0x02};
@@ -200,15 +190,18 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   bool dump_frames_{false};
   bool sniffer_only_{false};
   uint32_t max_frame_length_{128};
+  uint32_t in_frame_timeout_ms_{50};
 
   GPIOPin *flow_control_pin_{nullptr};
   std::vector<FramedRS485Listener *> listeners_;
   std::vector<std::vector<uint8_t>> tx_queue_;
+  size_t tx_queue_head_{0};
 
   bool in_frame_{false};
   uint8_t previous_byte_{0};
   std::vector<uint8_t> raw_frame_;
   uint32_t last_rx_time_{0};
+  bool last_ka_seen_{false};
   uint32_t last_ka_time_{0};
   uint32_t last_keepalive_ms_{0};
   uint32_t last_tx_time_{0};
@@ -229,95 +222,8 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   uint32_t crc_failures_{0};
   uint32_t commands_sent_{0};
   uint32_t command_drops_{0};
-  std::string last_frame_type_;
+  // Fixed buffer: 4 hex chars for a 2-byte frame type + null terminator.
+  char last_frame_type_[5]{};
 };
 
-#ifdef USE_BUTTON
-class FramedRS485Button : public button::Button {
- public:
-  void set_parent(FramedRS485Hub *parent) { this->parent_ = parent; }
-  void set_command_value(uint32_t command) { this->command_value_ = command; }
-
- protected:
-  void press_action() override;
-  FramedRS485Hub *parent_{nullptr};
-  uint32_t command_value_{0};
-};
-#endif  // USE_BUTTON
-
-#ifdef USE_BINARY_SENSOR
-class FramedRS485BinarySensor : public binary_sensor::BinarySensor, public FramedRS485Listener {
- public:
-  using decode_lambda_t = std::function<optional<bool>(const std::vector<uint8_t> &)>;
-  void set_decode(BinaryDecode decode) { this->decode_ = decode; }
-  void set_bit(uint8_t bit) { this->bit_ = bit; }
-  // display_text_match: all strings in match_on must appear (AND) to latch true;
-  // all strings in match_off must appear (AND) to latch false.
-  void add_match_on(const std::string &s) { this->match_on_.push_back(s); }
-  void add_match_off(const std::string &s) { this->match_off_.push_back(s); }
-  // Revert to false if no proof is seen within this many milliseconds (0 = never).
-  void set_timeout_ms(uint32_t ms) { this->timeout_ms_ = ms; }
-  void set_template(decode_lambda_t lambda) { this->lambda_ = lambda; }
-  void handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) override;
-
- protected:
-  BinaryDecode decode_{BINARY_DECODE_LED_BIT};
-  decode_lambda_t lambda_{nullptr};
-  uint8_t bit_{0};
-  std::vector<std::string> match_on_;
-  std::vector<std::string> match_off_;
-  uint32_t timeout_ms_{0};
-  uint32_t last_proof_ms_{0};  // 0 = no proof seen yet
-  bool timed_out_{false};
-};
-#endif  // USE_BINARY_SENSOR
-
-#ifdef USE_SENSOR
-class FramedRS485Sensor : public sensor::Sensor, public FramedRS485Listener {
- public:
-  using decode_lambda_t = std::function<optional<float>(const std::vector<uint8_t> &)>;
-  void set_decode(SensorDecode decode) { this->decode_ = decode; }
-  void set_offset(uint32_t offset) { this->offset_ = offset; }
-  void set_temperature_label(const std::string &label) { this->temperature_label_ = label; }
-  void set_template(decode_lambda_t lambda) { this->lambda_ = lambda; }
-  void handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) override;
-
- protected:
-  optional<float> decode_builtin_(FramedRS485Hub *hub, const std::vector<uint8_t> &payload) const;
-  SensorDecode decode_{SENSOR_DECODE_UINT8};
-  decode_lambda_t lambda_{nullptr};
-  uint32_t offset_{0};
-  std::string temperature_label_;
-};
-#endif  // USE_SENSOR
-
-#ifdef USE_TEXT_SENSOR
-class FramedRS485TextSensor : public text_sensor::TextSensor, public FramedRS485Listener {
- public:
-  using decode_lambda_t = std::function<optional<std::string>(const std::vector<uint8_t> &)>;
-  void set_decode(TextDecode decode) { this->decode_ = decode; }
-  void set_template(decode_lambda_t lambda) { this->lambda_ = lambda; }
-  void handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) override;
-
- protected:
-  TextDecode decode_{TEXT_DECODE_DISPLAY_TEXT};
-  decode_lambda_t lambda_{nullptr};
-};
-#endif  // USE_TEXT_SENSOR
-
-#ifdef USE_NUMBER
-class FramedRS485Number : public number::Number {
- public:
-  using encode_lambda_t = std::function<optional<std::vector<uint8_t>>(float)>;
-  void set_parent(FramedRS485Hub *parent) { this->parent_ = parent; }
-  void set_template(encode_lambda_t lambda) { this->lambda_ = lambda; }
-
- protected:
-  void control(float value) override;
-  FramedRS485Hub *parent_{nullptr};
-  encode_lambda_t lambda_{nullptr};
-};
-#endif  // USE_NUMBER
-
-}  // namespace framed_rs485
-}  // namespace esphome
+}  // namespace esphome::framed_rs485

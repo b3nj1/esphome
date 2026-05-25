@@ -10,13 +10,14 @@ from .. import (
     CONF_TEMPERATURE_LABEL,
     SENSOR_DECODES,
     FramedRS485Hub,
-    FramedRS485Sensor,
+    framed_rs485_ns,
     setup_listener,
     validate_frame_type,
 )
 
 AUTO_LOAD = ["framed_rs485"]
 
+FramedRS485Sensor = framed_rs485_ns.class_("FramedRS485Sensor", sensor.Sensor)
 
 CONFIG_SCHEMA = sensor.sensor_schema(
     FramedRS485Sensor,
@@ -53,6 +54,6 @@ async def to_code(config):
                     "payload",
                 )
             ],
-            return_type=cg.optional.template(float),
+            return_type=cg.optional.template(cg.float_),
         )
         cg.add(var.set_template(template_))

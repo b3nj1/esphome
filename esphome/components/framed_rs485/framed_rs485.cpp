@@ -2,12 +2,28 @@
 
 #include "esphome/core/application.h"
 
+#ifdef USE_BINARY_SENSOR
+#include "binary_sensor/framed_rs485_binary_sensor.h"
+#endif
+#ifdef USE_BUTTON
+#include "button/framed_rs485_button.h"
+#endif
+#ifdef USE_NUMBER
+#include "number/framed_rs485_number.h"
+#endif
+#ifdef USE_SENSOR
+#include "sensor/framed_rs485_sensor.h"
+#endif
+#ifdef USE_TEXT_SENSOR
+#include "text_sensor/framed_rs485_text_sensor.h"
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 
-namespace esphome {
-namespace framed_rs485 {
+namespace esphome::framed_rs485 {
 
 static const char *const TAG = "framed_rs485";
 
@@ -82,6 +98,16 @@ void FramedRS485Hub::setup() {
 void FramedRS485Hub::loop() {
   const uint32_t now = App.get_loop_component_start_time();
   this->read_uart_(now);
+
+  // Reset receive state if a partial frame has been sitting on the bus longer than the
+  // intra-frame timeout. Without this, a cable pull or noise burst mid-frame would
+  // permanently stall reception until the next valid frame terminator arrived.
+  if (this->in_frame_ && this->in_frame_timeout_ms_ > 0 && now - this->last_rx_time_ >= this->in_frame_timeout_ms_) {
+    ESP_LOGW(TAG, "Intra-frame timeout — resetting receive state");
+    this->in_frame_ = false;
+    this->raw_frame_.clear();
+  }
+
   this->maybe_tx_(now);
   // Unsigned subtraction wraps correctly so this comparison handles the 49-day millis rollover.
   if (this->tx_start_pending_ && now - this->tx_start_at_ < 0x80000000UL) {
@@ -89,9 +115,9 @@ void FramedRS485Hub::loop() {
     this->set_tx_mode_(true);
     this->write_array(this->pending_tx_frame_);
     this->flush();
-    char hex_buf[format_hex_size(270)];
-    format_hex_to(hex_buf, this->pending_tx_frame_.data(), this->pending_tx_frame_.size());
-    ESP_LOGD(TAG, "TX %s", hex_buf);
+    ESP_LOGD(TAG, "TX %s",
+             format_hex(this->pending_tx_frame_).c_str());  // NOLINT(cppcoreguidelines-pro-type-vararg): debug path,
+                                                            // compiled out in non-debug builds; frame size is variable
     this->last_tx_time_ = now;
     this->commands_sent_++;
     this->tx_release_at_ = now + this->tx_guard_time_;
@@ -110,7 +136,7 @@ void FramedRS485Hub::dump_config() {
                 this->escape_byte_);
   ESP_LOGCONFIG(TAG, "  CRC type: %s, accept header CRC: %s, accept payload CRC: %s", crc_type_str(this->crc_type_),
                 YESNO(this->accept_header_crc_), YESNO(this->accept_payload_crc_));
-  char gate_hex[32];
+  char gate_hex[format_hex_size(8)];  // gate frame type is at most a few bytes; 8 is generous
   format_hex_to(gate_hex, this->tx_gate_frame_type_.data(), this->tx_gate_frame_type_.size());
   ESP_LOGCONFIG(TAG, "  TX gate: %s, gate frame: %s, gate delay: %ums", tx_gate_mode_str(this->tx_gate_mode_), gate_hex,
                 this->tx_gate_delay_);
@@ -138,7 +164,7 @@ bool FramedRS485Hub::queue_command_value(uint32_t command) {
   this->build_key_payload_(command, this->tx_payload_buf_);
   this->build_frame_(this->tx_payload_buf_, this->tx_frame_buf_);
   if (this->queue_policy_ == QUEUE_REPLACE_LATEST) {
-    if (!this->tx_queue_.empty() || this->tx_start_pending_) {
+    if (this->queue_size_() > 0 || this->tx_start_pending_) {
       ESP_LOGW(TAG, "Replacing pending framed_rs485 command before it was transmitted");
       this->command_drops_++;
     }
@@ -147,9 +173,9 @@ bool FramedRS485Hub::queue_command_value(uint32_t command) {
       return true;
     }
     this->tx_queue_.clear();
+    this->tx_queue_head_ = 0;
   } else {
-    size_t queued = this->tx_queue_.size() + (this->tx_start_pending_ ? 1 : 0);
-    if (queued >= this->max_queue_size_) {
+    if (this->queue_size_() + (this->tx_start_pending_ ? 1 : 0) >= this->max_queue_size_) {
       ESP_LOGW(TAG, "framed_rs485 command queue full; dropping new command");
       this->command_drops_++;
       return false;
@@ -202,14 +228,15 @@ void FramedRS485Hub::process_raw_frame_(uint32_t now) {
   this->frames_received_++;
   this->update_last_frame_type_();
   if (this->dump_frames_) {
-    char hex_buf[format_hex_size(130)];
-    format_hex_to(hex_buf, this->rx_payload_.data(), this->rx_payload_.size());
-    ESP_LOGD(TAG, "RX %s", hex_buf);
+    ESP_LOGD(TAG, "RX %s",
+             format_hex(this->rx_payload_).c_str());  // NOLINT(cppcoreguidelines-pro-type-vararg): debug path gated by
+                                                      // dump_frames; payload size is variable
   }
 
   if (this->frame_type_equals_(this->rx_payload_, this->tx_gate_frame_type_)) {
-    if (this->last_ka_time_ != 0)
+    if (this->last_ka_seen_)
       this->last_keepalive_ms_ = now - this->last_ka_time_;
+    this->last_ka_seen_ = true;
     this->last_ka_time_ = now;
     if (this->tx_gate_mode_ == TX_GATE_FRAME_TRIGGER)
       this->send_next_(now);
@@ -363,27 +390,33 @@ void FramedRS485Hub::build_frame_(const std::vector<uint8_t> &payload, std::vect
 void FramedRS485Hub::build_key_payload_(uint32_t command, std::vector<uint8_t> &out) const {
   out.clear();
   if (this->key_format_ == KEY_FORMAT_WIRELESS_9BYTE) {
+    // Hayward wireless remote frame type 0x0083: 3-byte header + 4-byte key × 2 + 1 pad byte.
+    // Source: https://github.com/swilson/aqualogic (bus captures, wireless remote protocol).
     out.push_back(0x00);
-    out.push_back(0x83);
-    out.push_back(0x01);
+    out.push_back(0x83);  // frame sub-type: wireless keypress
+    out.push_back(0x01);  // sequence / channel byte, always 0x01 for single remote
     for (int repeat = 0; repeat < 2; repeat++) {
       out.push_back((command >> 24) & 0xFF);
       out.push_back((command >> 16) & 0xFF);
       out.push_back((command >> 8) & 0xFF);
       out.push_back(command & 0xFF);
     }
-    out.push_back(0x00);
+    out.push_back(0x00);  // trailing pad
     return;
   }
 
   if (this->key_format_ == KEY_FORMAT_JANDY_ALLBUTTON) {
+    // Jandy AquaLink RS AllButton frame: 3-byte header + 1-byte button code.
+    // Source: Jandy RS-485 protocol documentation.
     out.push_back(0x00);
-    out.push_back(0x01);
-    out.push_back(0x80);
+    out.push_back(0x01);  // frame sub-type: AllButton keypress
+    out.push_back(0x80);  // AllButton master address
     out.push_back(static_cast<uint8_t>(command & 0xFF));
     return;
   }
 
+  // Hayward wired remote / wired local: 2-byte frame type + 2-byte key + 2 pad bytes.
+  // Sub-type 0x03 = wired remote, 0x02 = wired local (local panel).
   out.push_back(0x00);
   out.push_back(this->key_format_ == KEY_FORMAT_WIRED_REMOTE ? 0x03 : 0x02);
   uint16_t key = (command >> 16) & 0xFFFF;
@@ -394,7 +427,7 @@ void FramedRS485Hub::build_key_payload_(uint32_t command, std::vector<uint8_t> &
 }
 
 void FramedRS485Hub::maybe_tx_(uint32_t now) {
-  if (this->sniffer_only_ || this->tx_queue_.empty() || this->tx_start_pending_ || this->tx_release_pending_)
+  if (this->sniffer_only_ || this->queue_size_() == 0 || this->tx_start_pending_ || this->tx_release_pending_)
     return;
   if (this->tx_gate_mode_ == TX_GATE_IDLE_GAP && this->last_rx_time_ != 0 &&
       now - this->last_rx_time_ >= this->tx_idle_gap_)
@@ -404,33 +437,41 @@ void FramedRS485Hub::maybe_tx_(uint32_t now) {
     this->send_next_(now);
 }
 
+void FramedRS485Hub::queue_pop_front_() {
+  this->tx_queue_head_++;
+  // Reclaim storage once all elements have been consumed to avoid unbounded growth.
+  if (this->tx_queue_head_ >= this->tx_queue_.size()) {
+    this->tx_queue_.clear();
+    this->tx_queue_head_ = 0;
+  }
+}
+
 void FramedRS485Hub::send_next_(uint32_t now) {
   if (this->sniffer_only_ || this->tx_start_pending_)
     return;
-  if (this->tx_queue_.empty()) {
+  if (this->queue_size_() == 0) {
     if (this->has_idle_command_ && !this->tx_release_pending_)
       this->send_next_idle_(now);
     return;
   }
 
   if (this->tx_gate_delay_ > 0) {
-    this->pending_tx_frame_ = this->tx_queue_.front();
-    this->tx_queue_.erase(this->tx_queue_.begin());
+    this->pending_tx_frame_ = this->tx_queue_[this->tx_queue_head_];
+    this->queue_pop_front_();
     this->tx_start_at_ = now + this->tx_gate_delay_;
     this->tx_start_pending_ = true;
     return;
   }
 
   {
-    const auto &frame = this->tx_queue_.front();
+    const auto &frame = this->tx_queue_[this->tx_queue_head_];
     this->set_tx_mode_(true);
     this->write_array(frame);
     this->flush();
-    char hex_buf[format_hex_size(270)];
-    format_hex_to(hex_buf, frame.data(), frame.size());
-    ESP_LOGD(TAG, "TX %s", hex_buf);
+    ESP_LOGD(TAG, "TX %s", format_hex(frame).c_str());  // NOLINT(cppcoreguidelines-pro-type-vararg): debug path,
+                                                        // compiled out in non-debug builds; frame size is variable
   }
-  this->tx_queue_.erase(this->tx_queue_.begin());
+  this->queue_pop_front_();
   this->last_tx_time_ = now;
   this->commands_sent_++;
   this->tx_release_at_ = now + this->tx_guard_time_;
@@ -457,9 +498,9 @@ void FramedRS485Hub::send_next_idle_(uint32_t now) {
   this->tx_release_pending_ = true;
   if (this->tx_guard_time_ == 0)
     this->release_tx_();
-  char hex_buf[format_hex_size(270)];
-  format_hex_to(hex_buf, this->tx_frame_buf_.data(), this->tx_frame_buf_.size());
-  ESP_LOGD(TAG, "TX idle %s", hex_buf);
+  ESP_LOGD(TAG, "TX idle %s",
+           format_hex(this->tx_frame_buf_).c_str());  // NOLINT(cppcoreguidelines-pro-type-vararg): debug path, compiled
+                                                      // out in non-debug builds; frame size is variable
 }
 
 bool FramedRS485Hub::queue_raw_frame(const std::vector<uint8_t> &payload) {
@@ -470,7 +511,7 @@ bool FramedRS485Hub::queue_raw_frame(const std::vector<uint8_t> &payload) {
   }
   this->build_frame_(payload, this->tx_frame_buf_);
   if (this->queue_policy_ == QUEUE_REPLACE_LATEST) {
-    if (!this->tx_queue_.empty() || this->tx_start_pending_) {
+    if (this->queue_size_() > 0 || this->tx_start_pending_) {
       ESP_LOGW(TAG, "Replacing pending framed_rs485 frame before it was transmitted");
       this->command_drops_++;
     }
@@ -479,9 +520,9 @@ bool FramedRS485Hub::queue_raw_frame(const std::vector<uint8_t> &payload) {
       return true;
     }
     this->tx_queue_.clear();
+    this->tx_queue_head_ = 0;
   } else {
-    size_t queued = this->tx_queue_.size() + (this->tx_start_pending_ ? 1 : 0);
-    if (queued >= this->max_queue_size_) {
+    if (this->queue_size_() + (this->tx_start_pending_ ? 1 : 0) >= this->max_queue_size_) {
       ESP_LOGW(TAG, "framed_rs485 raw frame queue full; dropping frame");
       this->command_drops_++;
       return false;
@@ -509,18 +550,15 @@ bool FramedRS485Hub::frame_type_equals_(const std::vector<uint8_t> &payload,
 }
 
 void FramedRS485Hub::update_last_frame_type_() {
-  char buf[format_hex_size(2)];
   size_t len = std::min(this->rx_payload_.size(), size_t(2));
-  format_hex_to(buf, this->rx_payload_.data(), len);
-  this->last_frame_type_ = buf;
+  format_hex_to(this->last_frame_type_, this->rx_payload_.data(), len);
 }
 
 uint32_t FramedRS485Hub::decode_led_mask(const std::vector<uint8_t> &payload) {
   if (payload.size() < 6)
     return 0;
-  uint32_t current = static_cast<uint32_t>(payload[2]) | (static_cast<uint32_t>(payload[3]) << 8) |
-                     (static_cast<uint32_t>(payload[4]) << 16) | (static_cast<uint32_t>(payload[5]) << 24);
-  return current;
+  return static_cast<uint32_t>(payload[2]) | (static_cast<uint32_t>(payload[3]) << 8) |
+         (static_cast<uint32_t>(payload[4]) << 16) | (static_cast<uint32_t>(payload[5]) << 24);
 }
 
 uint32_t FramedRS485Hub::decode_led_mask_blinking(const std::vector<uint8_t> &payload) {
@@ -604,18 +642,22 @@ std::string FramedRS485Hub::normalize_display_ws(const std::string &s) {
 }
 
 #ifdef USE_BUTTON
-void FramedRS485Button::press_action() {
-  if (this->parent_ != nullptr)
-    this->parent_->queue_command_value(this->command_value_);
-}
+void FramedRS485Button::press_action() { this->parent_->queue_command_value(this->command_value_); }
 #endif  // USE_BUTTON
 
 #ifdef USE_BINARY_SENSOR
-// Returns true if all strings in needles appear (case-insensitive substring) in haystack.
+void FramedRS485BinarySensor::add_match_on(const std::string &s) {
+  this->match_on_.push_back(FramedRS485Hub::normalize_display_ws(s));
+}
+void FramedRS485BinarySensor::add_match_off(const std::string &s) {
+  this->match_off_.push_back(FramedRS485Hub::normalize_display_ws(s));
+}
+
+// Returns true if all needles appear (case-insensitive substring) in haystack.
+// Needles are expected to be pre-normalized (no extra whitespace).
 static bool all_match(const std::string &haystack, const std::vector<std::string> &needles) {
   for (const auto &needle : needles) {
-    std::string n = FramedRS485Hub::normalize_display_ws(needle);
-    auto it = std::search(haystack.begin(), haystack.end(), n.begin(), n.end(),
+    auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
                           [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
     if (it == haystack.end())
       return false;
@@ -681,21 +723,28 @@ optional<float> FramedRS485Sensor::decode_builtin_(FramedRS485Hub *hub, const st
     case SENSOR_DECODE_DISPLAY_TEMPERATURE: {
       std::string text;
       FramedRS485Hub::decode_display_text(payload, text);
+      // Locate the label first so that multi-temperature displays ("Air 68F Pool 84F")
+      // return the digit nearest the label rather than the first digit in the string.
+      size_t scan_from = 0;
       if (!this->temperature_label_.empty()) {
-        const std::string &label = this->temperature_label_;
-        bool label_found = false;
-        for (size_t p = 0; p + label.size() <= text.size() && !label_found; p++) {
-          label_found = true;
-          for (size_t j = 0; j < label.size() && label_found; j++) {
+        size_t pos = std::string::npos;
+        for (size_t p = 0; p + this->temperature_label_.size() <= text.size(); p++) {
+          bool match = true;
+          for (size_t j = 0; j < this->temperature_label_.size() && match; j++) {
             if (std::tolower(static_cast<unsigned char>(text[p + j])) !=
-                std::tolower(static_cast<unsigned char>(label[j])))
-              label_found = false;
+                std::tolower(static_cast<unsigned char>(this->temperature_label_[j])))
+              match = false;
+          }
+          if (match) {
+            pos = p;
+            break;
           }
         }
-        if (!label_found)
+        if (pos == std::string::npos)
           return {};
+        scan_from = pos;
       }
-      for (size_t i = 0; i < text.size(); i++) {
+      for (size_t i = scan_from; i < text.size(); i++) {
         if (!std::isdigit(static_cast<unsigned char>(text[i])))
           continue;
         size_t end = i;
@@ -713,7 +762,7 @@ optional<float> FramedRS485Sensor::decode_builtin_(FramedRS485Hub *hub, const st
           }
         }
         if (has_unit)
-          return static_cast<float>(std::atoi(text.substr(i, end - i).c_str()));
+          return static_cast<float>(std::strtol(&text[i], nullptr, 10));
         i = end;
       }
       return {};
@@ -796,7 +845,7 @@ void FramedRS485TextSensor::handle_frame(FramedRS485Hub *hub, const std::vector<
     FramedRS485Hub::decode_display_blink_text(payload, text);
     value = std::move(text);
   } else if (this->decode_ == TEXT_DECODE_LAST_FRAME_TYPE) {
-    value = hub->get_last_frame_type();
+    value = std::string(hub->get_last_frame_type());
   }
   if (value.has_value())
     this->publish_state(value.value());
@@ -805,7 +854,7 @@ void FramedRS485TextSensor::handle_frame(FramedRS485Hub *hub, const std::vector<
 
 #ifdef USE_NUMBER
 void FramedRS485Number::control(float value) {
-  if (this->parent_ == nullptr || this->lambda_ == nullptr)
+  if (this->lambda_ == nullptr)
     return;
   auto payload = this->lambda_(value);
   if (!payload.has_value())
@@ -815,5 +864,4 @@ void FramedRS485Number::control(float value) {
 }
 #endif  // USE_NUMBER
 
-}  // namespace framed_rs485
-}  // namespace esphome
+}  // namespace esphome::framed_rs485
