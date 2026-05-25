@@ -1,0 +1,57 @@
+framed_rs485:
+  - id: framed_rs485_hub
+    uart_id: uart_bus
+    profile: generic_framed_rs485
+
+binary_sensor:
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Lights"
+    frame_type: [0x01, 0x02]
+    decode: led_bit
+    bit: 0
+
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Heater Auto Mode"
+    frame_type: [0x01, 0x03]
+    decode: display_text_match
+    match_on: ["Heater", "Auto"]
+    match_off: ["Heater", "Manual"]
+    timeout: 60s
+
+sensor:
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Pool Temp"
+    frame_type: [0x01, 0x03]
+    decode: display_temperature
+
+text_sensor:
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Display"
+    frame_type: [0x01, 0x03]
+    decode: display_text
+
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Display Blink"
+    frame_type: [0x01, 0x03]
+    decode: display_blink_text
+
+button:
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Lights Toggle"
+    command: 0x00010000
+
+number:
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "VSP Speed"
+    min_value: 0
+    max_value: 100
+    step: 1
+    lambda: |-
+      return std::vector<uint8_t>{0x0c, 0x01, 0x00, static_cast<uint8_t>(x)};
