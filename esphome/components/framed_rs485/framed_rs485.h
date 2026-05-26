@@ -10,6 +10,13 @@
 
 namespace esphome::framed_rs485 {
 
+// Maximum number of bytes in a frame-type prefix (schema cap: cv.Length(max=8)).
+// StaticVector template parameters and the Python cv.Length(max=) validator must agree.
+static constexpr size_t MAX_FRAME_TYPE_LEN = 8;
+
+// Framing overhead added to every TX frame: DLE+STX(2) + DLE+ETX(2) + escaped CRC max(4).
+static constexpr size_t FRAME_OVERHEAD_BYTES = 8;
+
 /// Built-in decode modes for the sensor platform.
 enum SensorDecode {
   SENSOR_DECODE_UINT8,              ///< Unsigned byte at the configured offset.
@@ -66,12 +73,16 @@ class FramedRS485Hub;
 
 class FramedRS485Listener {
  public:
-  void set_frame_type(const std::vector<uint8_t> &frame_type) { this->frame_type_ = frame_type; }
+  void set_frame_type(const std::vector<uint8_t> &frame_type) {
+    this->frame_type_.assign(frame_type.begin(), frame_type.end());
+  }
   bool matches(const std::vector<uint8_t> &payload) const;
   virtual void handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) = 0;
 
  protected:
-  std::vector<uint8_t> frame_type_;
+  // Fixed-size storage: no heap allocation per listener. MAX_FRAME_TYPE_LEN matches the
+  // Python schema cv.Length(max=8) cap on frame_type lists.
+  StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> frame_type_;
 };
 
 /// Automation trigger that fires when a framed RS-485 frame matching the configured
@@ -79,6 +90,10 @@ class FramedRS485Listener {
 /// `payload`: bytes 0-1 are the two-byte frame type, bytes 2+ are the frame data.
 ///
 /// Registered with the hub via register_listener() — it is itself a listener.
+///
+/// Note: build_callback_automation() (preferred by CLAUDE.md for stateless triggers) cannot
+/// be used here because the trigger must also implement FramedRS485Listener (which requires
+/// frame_type_ storage and a virtual handle_frame()). The full Trigger subclass is justified.
 class FramedRS485FrameTrigger : public Trigger<std::vector<uint8_t>>, public FramedRS485Listener {
  public:
   void handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) override {
@@ -102,7 +117,9 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   void set_crc_type(CrcType type) { this->crc_type_ = type; }
   void set_tx_crc_variant(CrcVariant variant) { this->tx_crc_variant_ = variant; }
   void set_tx_gate_mode(TxGateMode mode) { this->tx_gate_mode_ = mode; }
-  void set_tx_gate_frame_type(const std::vector<uint8_t> &frame_type) { this->tx_gate_frame_type_ = frame_type; }
+  void set_tx_gate_frame_type(const std::vector<uint8_t> &frame_type) {
+    this->tx_gate_frame_type_.assign(frame_type.begin(), frame_type.end());
+  }
   void set_tx_gate_delay(uint32_t delay) { this->tx_gate_delay_ = delay; }
   void set_tx_idle_gap(uint32_t idle_gap) { this->tx_idle_gap_ = idle_gap; }
   void set_tx_fixed_interval(uint32_t interval) { this->tx_fixed_interval_ = interval; }
@@ -127,9 +144,7 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   uint32_t get_commands_sent() const { return this->commands_sent_; }
   uint32_t get_command_drops() const { return this->command_drops_; }
   uint32_t get_last_keepalive_ms() const { return this->last_keepalive_ms_; }
-  uint32_t get_queue_depth() const {
-    return (this->tx_queue_.size() - this->tx_queue_head_) + (this->tx_start_pending_ ? 1 : 0);
-  }
+  uint32_t get_queue_depth() const { return this->tx_queue_count_ + (this->tx_start_pending_ ? 1 : 0); }
   const char *get_last_frame_type() const { return this->last_frame_type_; }
 
  protected:
@@ -145,9 +160,10 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   void maybe_tx_(uint32_t now);
   void send_next_(uint32_t now);
   void send_next_idle_(uint32_t now);
-  bool frame_type_equals_(const std::vector<uint8_t> &payload, const std::vector<uint8_t> &frame_type) const;
+  bool frame_type_equals_(const std::vector<uint8_t> &payload,
+                          const StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> &frame_type) const;
   void update_last_frame_type_();
-  size_t queue_size_() const { return this->tx_queue_.size() - this->tx_queue_head_; }
+  size_t queue_size_() const { return this->tx_queue_count_; }
   void queue_pop_front_();
 
   uint8_t dle_{0x10};
@@ -159,7 +175,7 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   CrcType crc_type_{CRC_TYPE_SUM16};
   CrcVariant tx_crc_variant_{CRC_HEADER_INCLUSIVE};
   TxGateMode tx_gate_mode_{TX_GATE_FRAME_TRIGGER};
-  std::vector<uint8_t> tx_gate_frame_type_{0x01, 0x01};
+  StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> tx_gate_frame_type_{0x01, 0x01};
   uint32_t tx_gate_delay_{0};
   uint32_t tx_idle_gap_{4};
   uint32_t tx_fixed_interval_{100};
@@ -174,8 +190,13 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   uint32_t in_frame_timeout_ms_{50};
 
   std::vector<FramedRS485Listener *> listeners_;
+  // Ring buffer: pre-sized and pre-reserved in setup() to avoid per-frame heap allocation.
+  // Slots are swapped with tx_frame_buf_ on enqueue (no copy). MAX size is max_frame_length_
+  // * 2 + FRAME_OVERHEAD_BYTES (worst case: all payload bytes are DLE and must be escaped).
   std::vector<std::vector<uint8_t>> tx_queue_;
-  size_t tx_queue_head_{0};
+  size_t tx_queue_head_{0};   // index of the next slot to read
+  size_t tx_queue_tail_{0};   // index of the next slot to write
+  size_t tx_queue_count_{0};  // number of frames currently in the ring buffer
 
   bool in_frame_{false};
   uint8_t previous_byte_{0};
@@ -186,8 +207,9 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   uint32_t last_keepalive_ms_{0};
   uint32_t last_tx_time_{0};
   bool tx_start_pending_{false};
+  bool pending_is_idle_{false};  // true when pending_tx_frame_ is an idle keepalive, not a real command
   uint32_t tx_start_at_{0};
-  std::vector<uint8_t> pending_tx_frame_;
+  std::vector<uint8_t> pending_tx_frame_;  // pre-reserved in setup()
 
   // Pre-allocated scratch buffers reused each loop to avoid heap churn.
   std::vector<uint8_t> rx_unescaped_;

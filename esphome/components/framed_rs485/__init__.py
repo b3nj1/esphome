@@ -168,6 +168,10 @@ CRC_SCHEMA = cv.Schema(
         cv.Optional(
             CONF_RX_ACCEPT, default=["header_inclusive", "payload_only"]
         ): cv.ensure_list(cv.one_of(*CRC_VARIANTS, lower=True)),
+        # tx_variant has no schema-level default because the correct default is
+        # profile-dependent (Hayward wired uses "payload_only"; all others use
+        # "header_inclusive"). validate_hub() always injects it from _profile_defaults()
+        # if the user does not set it explicitly.
         cv.Optional(CONF_TX_VARIANT): cv.one_of(*CRC_VARIANTS, lower=True),
     }
 )

@@ -156,6 +156,8 @@ sensor:
     frame_type: []
     decode: queue_depth
     entity_category: diagnostic
+    state_class: measurement
+    accuracy_decimals: 0
 
 text_sensor:
   # Lambda decode: strip non-printable bytes and return ASCII string.

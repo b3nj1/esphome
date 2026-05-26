@@ -82,13 +82,19 @@ void FramedRS485Hub::setup() {
                   "use idle_gap or fixed_delay instead");
   }
   // Pre-allocate scratch buffers to avoid per-frame heap churn on the main receive path.
+  const size_t tx_slot_capacity = this->max_frame_length_ * 2 + FRAME_OVERHEAD_BYTES;
   this->raw_frame_.reserve(this->max_frame_length_);
   this->rx_unescaped_.reserve(this->max_frame_length_);
   this->rx_payload_.reserve(this->max_frame_length_);
   this->tx_payload_buf_.reserve(16);
-  this->tx_escaped_buf_.reserve(this->max_frame_length_);
-  this->tx_frame_buf_.reserve(this->max_frame_length_ + 8);
-  this->tx_queue_.reserve(this->max_queue_size_);
+  // tx_escaped_buf_ worst case: every payload byte is DLE and requires an escape byte.
+  this->tx_escaped_buf_.reserve(this->max_frame_length_ * 2);
+  this->tx_frame_buf_.reserve(tx_slot_capacity);
+  this->pending_tx_frame_.reserve(tx_slot_capacity);
+  // Ring buffer: pre-size and pre-reserve each slot so enqueue only swaps, never allocates.
+  this->tx_queue_.resize(this->max_queue_size_);
+  for (auto &slot : this->tx_queue_)
+    slot.reserve(tx_slot_capacity);
 }
 
 void FramedRS485Hub::loop() {
@@ -114,7 +120,8 @@ void FramedRS485Hub::loop() {
              format_hex(this->pending_tx_frame_).c_str());  // NOLINT(cppcoreguidelines-pro-type-vararg): debug path,
                                                             // compiled out in non-debug builds; frame size is variable
     this->last_tx_time_ = now;
-    this->commands_sent_++;
+    if (!this->pending_is_idle_)
+      this->commands_sent_++;
   }
 }
 
@@ -124,13 +131,18 @@ void FramedRS485Hub::dump_config() {
                 this->escape_byte_);
   ESP_LOGCONFIG(TAG, "  CRC type: %s, accept header CRC: %s, accept payload CRC: %s", crc_type_str(this->crc_type_),
                 YESNO(this->accept_header_crc_), YESNO(this->accept_payload_crc_));
-  char gate_hex[format_hex_size(8)];  // schema caps gate.frame_type to 8 bytes
-  format_hex_to(gate_hex, this->tx_gate_frame_type_.data(), this->tx_gate_frame_type_.size());
+  // gate_hex buffer holds MAX_FRAME_TYPE_LEN bytes; std::min guards against a direct C++ caller
+  // bypassing the schema's cv.Length(max=MAX_FRAME_TYPE_LEN) constraint.
+  char gate_hex[format_hex_size(MAX_FRAME_TYPE_LEN)];
+  format_hex_to(gate_hex, this->tx_gate_frame_type_.data(),
+                std::min(this->tx_gate_frame_type_.size(), MAX_FRAME_TYPE_LEN));
   ESP_LOGCONFIG(TAG, "  TX gate: %s, gate frame: %s, gate delay: %ums", tx_gate_mode_str(this->tx_gate_mode_), gate_hex,
                 this->tx_gate_delay_);
   ESP_LOGCONFIG(TAG, "  TX idle gap: %ums, TX interval: %ums", this->tx_idle_gap_, this->tx_fixed_interval_);
   ESP_LOGCONFIG(TAG, "  Queue policy: %s, queue size: %u", queue_policy_str(this->queue_policy_),
                 this->max_queue_size_);
+  ESP_LOGCONFIG(TAG, "  Max frame length: %u, frame timeout: %ums", this->max_frame_length_,
+                this->in_frame_timeout_ms_);
   ESP_LOGCONFIG(TAG, "  Sniffer only: %s, dump frames: %s", YESNO(this->sniffer_only_), YESNO(this->dump_frames_));
 }
 
@@ -159,19 +171,27 @@ bool FramedRS485Hub::enqueue_frame_() {
       this->command_drops_++;
     }
     if (this->tx_start_pending_) {
-      this->pending_tx_frame_ = this->tx_frame_buf_;
+      // Swap the new frame into pending_tx_frame_ — both are pre-reserved, no allocation.
+      std::swap(this->pending_tx_frame_, this->tx_frame_buf_);
+      this->pending_is_idle_ = false;
       return true;
     }
-    this->tx_queue_.clear();
+    // Reset ring buffer logical state; slot capacity is preserved.
     this->tx_queue_head_ = 0;
+    this->tx_queue_tail_ = 0;
+    this->tx_queue_count_ = 0;
   } else {
-    if (this->queue_size_() + (this->tx_start_pending_ ? 1 : 0) >= this->max_queue_size_) {
+    if (this->tx_queue_count_ + (this->tx_start_pending_ ? 1 : 0) >= this->max_queue_size_) {
       ESP_LOGW(TAG, "framed_rs485 frame queue full; dropping frame");
       this->command_drops_++;
       return false;
     }
   }
-  this->tx_queue_.push_back(this->tx_frame_buf_);
+  // Swap tx_frame_buf_ into the pre-reserved tail slot — no heap allocation.
+  // After the swap, tx_frame_buf_ holds the slot's old content (empty, capacity intact).
+  std::swap(this->tx_queue_[this->tx_queue_tail_], this->tx_frame_buf_);
+  this->tx_queue_tail_ = (this->tx_queue_tail_ + 1) % this->max_queue_size_;
+  this->tx_queue_count_++;
   return true;
 }
 
@@ -190,14 +210,14 @@ void FramedRS485Hub::read_uart_(uint32_t now) {
       continue;
     }
 
-    this->raw_frame_.push_back(byte);
-    if (this->raw_frame_.size() > this->max_frame_length_) {
+    if (this->raw_frame_.size() >= this->max_frame_length_) {
       ESP_LOGW(TAG, "Frame exceeded max_frame_length");
       this->in_frame_ = false;
       this->raw_frame_.clear();
       this->previous_byte_ = byte;
       continue;
     }
+    this->raw_frame_.push_back(byte);
 
     const size_t size = this->raw_frame_.size();
     if (size >= 2 && this->raw_frame_[size - 2] == this->dle_ && byte == this->etx_) {
@@ -239,6 +259,9 @@ void FramedRS485Hub::process_raw_frame_(uint32_t now) {
 
 bool FramedRS485Hub::validate_frame_() {
   const auto &frame = this->raw_frame_;
+  // Minimum valid frame: DLE(1)+STX(1) + frame_type(2) + CRC_1byte_min(1) + DLE(1)+ETX(1) = 7
+  // but sum16 (2-byte CRC) gives minimum 8. The constant 6 is the no-CRC minimum and is the
+  // tightest pre-check before crc_length_() is called below.
   if (frame.size() < 6 || frame[0] != this->dle_ || frame[1] != this->stx_ || frame[frame.size() - 2] != this->dle_ ||
       frame[frame.size() - 1] != this->etx_)
     return false;
@@ -331,13 +354,17 @@ size_t FramedRS485Hub::crc_length_() const {
     case CRC_TYPE_SUM16:
     case CRC_TYPE_CRC16_MODBUS:
       return 2;
+    default:
+      // All CrcType values are handled above. A new CrcType must add a case here
+      // AND update calculate_crc_() to keep them in sync.
+      return 2;
   }
-  return 2;
 }
 
 void FramedRS485Hub::escape_dle_(const std::vector<uint8_t> &data, std::vector<uint8_t> &out) const {
   out.clear();
-  out.reserve(data.size());
+  // Worst case: every byte equals DLE and requires an escape byte → 2× input size.
+  out.reserve(data.size() * 2);
   for (auto b : data) {
     out.push_back(b);
     if (b == this->dle_)
@@ -427,12 +454,10 @@ void FramedRS485Hub::maybe_tx_(uint32_t now) {
 }
 
 void FramedRS485Hub::queue_pop_front_() {
-  this->tx_queue_head_++;
-  // Reclaim storage once all elements have been consumed to avoid unbounded growth.
-  if (this->tx_queue_head_ >= this->tx_queue_.size()) {
-    this->tx_queue_.clear();
-    this->tx_queue_head_ = 0;
-  }
+  // Clear the slot content but keep its reserved capacity for the next enqueue swap.
+  this->tx_queue_[this->tx_queue_head_].clear();
+  this->tx_queue_head_ = (this->tx_queue_head_ + 1) % this->max_queue_size_;
+  this->tx_queue_count_--;
 }
 
 void FramedRS485Hub::send_next_(uint32_t now) {
@@ -445,10 +470,12 @@ void FramedRS485Hub::send_next_(uint32_t now) {
   }
 
   if (this->tx_gate_delay_ > 0) {
-    this->pending_tx_frame_ = this->tx_queue_[this->tx_queue_head_];
+    // Swap the frame into pending_tx_frame_ — both are pre-reserved, no allocation.
+    std::swap(this->pending_tx_frame_, this->tx_queue_[this->tx_queue_head_]);
     this->queue_pop_front_();
     this->tx_start_at_ = now + this->tx_gate_delay_;
     this->tx_start_pending_ = true;
+    this->pending_is_idle_ = false;
     return;
   }
 
@@ -468,15 +495,16 @@ void FramedRS485Hub::send_next_idle_(uint32_t now) {
   this->build_key_payload_(this->idle_command_, this->tx_payload_buf_);
   this->build_frame_(this->tx_payload_buf_, this->tx_frame_buf_);
   if (this->tx_gate_delay_ > 0) {
-    this->pending_tx_frame_ = this->tx_frame_buf_;
+    std::swap(this->pending_tx_frame_, this->tx_frame_buf_);
     this->tx_start_at_ = now + this->tx_gate_delay_;
     this->tx_start_pending_ = true;
+    this->pending_is_idle_ = true;
     return;
   }
   this->write_array(this->tx_frame_buf_);
   this->flush();
   this->last_tx_time_ = now;
-  this->commands_sent_++;
+  // Idle keepalives are not counted in commands_sent_ — that counter tracks only real HA commands.
   ESP_LOGD(TAG, "TX idle %s",
            format_hex(this->tx_frame_buf_).c_str());  // NOLINT(cppcoreguidelines-pro-type-vararg): debug path, compiled
                                                       // out in non-debug builds; frame size is variable
@@ -493,7 +521,7 @@ bool FramedRS485Hub::queue_raw_frame(const std::vector<uint8_t> &payload) {
 }
 
 bool FramedRS485Hub::frame_type_equals_(const std::vector<uint8_t> &payload,
-                                        const std::vector<uint8_t> &frame_type) const {
+                                        const StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> &frame_type) const {
   if (frame_type.empty() || payload.size() < frame_type.size())
     return false;
   return std::equal(frame_type.begin(), frame_type.end(), payload.begin());
@@ -575,15 +603,12 @@ void FramedRS485BinarySensor::handle_frame(FramedRS485Hub *hub, const std::vecto
     text = std::move(result.value());
   } else {
     // Default: printable ASCII bytes from the full payload.
-    // Build into a stack buffer first, then assign once to avoid push_back reallocation
-    // churn on payloads that exceed the SSO limit (~11-15 bytes on 32-bit libc++).
-    char buf[128];
-    size_t blen = 0;
+    // Reserve payload.size() so push_back never reallocates regardless of payload length.
+    text.reserve(payload.size());
     for (auto b : payload) {
-      if (b >= 0x20 && b < 0x7F && blen < sizeof(buf))
-        buf[blen++] = static_cast<char>(b);
+      if (b >= 0x20 && b < 0x7F)
+        text.push_back(static_cast<char>(b));
     }
-    text.assign(buf, blen);
   }
   normalize_display_ws(text);
 
