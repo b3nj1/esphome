@@ -1,0 +1,52 @@
+## Config-only validation tests for profile UART enforcement.
+## These are intentionally NOT compiled — they test schema validation paths only.
+
+uart:
+  # Hayward profiles require 19200 8N2
+  - id: hayward_uart
+    tx_pin: GPIO17
+    rx_pin: GPIO16
+    baud_rate: 19200
+    data_bits: 8
+    parity: NONE
+    stop_bits: 2
+
+  # Jandy AquaLink RS requires 9600 8N1
+  - id: jandy_uart
+    tx_pin: GPIO19
+    rx_pin: GPIO18
+    baud_rate: 9600
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+
+framed_rs485:
+  # Hayward wireless profile — default, no key_format override needed.
+  - id: hayward_wireless_hub
+    uart_id: hayward_uart
+    profile: hayward_aqualogic_wireless
+
+  # Hayward wired remote profile — CRC is payload-only, key format overridden by profile.
+  - id: hayward_wired_remote_hub
+    uart_id: hayward_uart
+    profile: hayward_aqualogic_wired_remote
+
+  # Hayward wired local — same UART as wired remote, different key format.
+  - id: hayward_wired_local_hub
+    uart_id: hayward_uart
+    profile: hayward_aqualogic_wired_local
+
+  # Jandy AquaLink RS profile.
+  - id: jandy_hub
+    uart_id: jandy_uart
+    profile: jandy_aqualink_rs
+
+  # Generic profile bypasses UART enforcement and accepts any settings.
+  - id: generic_hub
+    uart_id: jandy_uart   # reuse 9600 UART — generic profile does not validate
+    profile: generic_framed_rs485
+    crc:
+      type: none
+    tx:
+      gate:
+        mode: idle_gap
