@@ -1,48 +1,29 @@
 #pragma once
 
+#include "esphome/core/automation.h"
 #include "esphome/core/component.h"
-#include "esphome/core/gpio.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include "esphome/components/uart/uart.h"
 
-#include <string>
 #include <vector>
 
 namespace esphome::framed_rs485 {
 
 /// Built-in decode modes for the sensor platform.
 enum SensorDecode {
-  SENSOR_DECODE_LED_MASK,             ///< Current LED bitmask as a 32-bit float (AquaLogic frame 0x0102).
-  SENSOR_DECODE_LED_MASK_BLINKING,    ///< Blinking LED bitmask as a 32-bit float (AquaLogic frame 0x0102).
-  SENSOR_DECODE_DISPLAY_TEMPERATURE,  ///< Temperature digit nearest the configured label in display text.
-  SENSOR_DECODE_UINT8,                ///< Unsigned byte at the configured offset.
-  SENSOR_DECODE_UINT16_BE,            ///< Unsigned 16-bit big-endian at the configured offset.
-  SENSOR_DECODE_UINT16_LE,            ///< Unsigned 16-bit little-endian at the configured offset.
-  SENSOR_DECODE_UINT32_BE,            ///< Unsigned 32-bit big-endian at the configured offset.
-  SENSOR_DECODE_UINT32_LE,            ///< Unsigned 32-bit little-endian at the configured offset.
-  SENSOR_DECODE_BCD,                  ///< Packed BCD byte at the configured offset.
-  SENSOR_DECODE_VSP_SPEED_REQUEST,    ///< Hayward VSP commanded speed % (frame 0x0C01, bytes 2-3).
-  SENSOR_DECODE_VSP_POWER_BCD,        ///< Hayward VSP power in watts, BCD encoded (frame 0x000C, bytes 5-6).
-  SENSOR_DECODE_FRAMES_RECEIVED,      ///< Diagnostic: running count of validated RX frames.
-  SENSOR_DECODE_CRC_FAILURES,         ///< Diagnostic: running count of CRC-failed frames.
-  SENSOR_DECODE_COMMANDS_SENT,        ///< Diagnostic: running count of transmitted frames.
-  SENSOR_DECODE_COMMAND_DROPS,        ///< Diagnostic: commands dropped (queue full or sniffer mode).
-  SENSOR_DECODE_LAST_KEEPALIVE_MS,    ///< Diagnostic: interval (ms) between the last two gate frames.
-  SENSOR_DECODE_QUEUE_DEPTH,          ///< Diagnostic: current TX queue depth.
-};
-
-/// Built-in decode modes for the binary_sensor platform.
-enum BinaryDecode {
-  BINARY_DECODE_LED_BIT,             ///< True when a specific bit of the 32-bit LED mask is set.
-  BINARY_DECODE_DISPLAY_TEXT_MATCH,  ///< Latching case-insensitive substring match against decoded display text.
-};
-
-/// Built-in decode modes for the text_sensor platform.
-enum TextDecode {
-  TEXT_DECODE_DISPLAY_TEXT,        ///< Full display text with degree-sign substitution and whitespace trimmed.
-  TEXT_DECODE_DISPLAY_BLINK_TEXT,  ///< Only the characters actively blinking (high bit set) on the display.
-  TEXT_DECODE_LAST_FRAME_TYPE,     ///< Hex string of the two-byte type of the most recently received frame.
+  SENSOR_DECODE_UINT8,              ///< Unsigned byte at the configured offset.
+  SENSOR_DECODE_UINT16_BE,          ///< Unsigned 16-bit big-endian at the configured offset.
+  SENSOR_DECODE_UINT16_LE,          ///< Unsigned 16-bit little-endian at the configured offset.
+  SENSOR_DECODE_UINT32_BE,          ///< Unsigned 32-bit big-endian at the configured offset.
+  SENSOR_DECODE_UINT32_LE,          ///< Unsigned 32-bit little-endian at the configured offset.
+  SENSOR_DECODE_BCD,                ///< Packed BCD byte at the configured offset.
+  SENSOR_DECODE_FRAMES_RECEIVED,    ///< Diagnostic: running count of validated RX frames.
+  SENSOR_DECODE_CRC_FAILURES,       ///< Diagnostic: running count of CRC-failed frames.
+  SENSOR_DECODE_COMMANDS_SENT,      ///< Diagnostic: running count of transmitted frames.
+  SENSOR_DECODE_COMMAND_DROPS,      ///< Diagnostic: commands dropped (queue full or sniffer mode).
+  SENSOR_DECODE_LAST_KEEPALIVE_MS,  ///< Diagnostic: interval (ms) between the last two gate frames.
+  SENSOR_DECODE_QUEUE_DEPTH,        ///< Diagnostic: current TX queue depth.
 };
 
 /// Key-frame format used when encoding button commands for TX.
@@ -93,6 +74,18 @@ class FramedRS485Listener {
   std::vector<uint8_t> frame_type_;
 };
 
+/// Automation trigger that fires when a framed RS-485 frame matching the configured
+/// frame_type is received. The payload (bytes after the two-byte frame type) is passed
+/// as the automation argument `payload`.
+///
+/// Registered with the hub via register_listener() — it is itself a listener.
+class FramedRS485FrameTrigger : public Trigger<std::vector<uint8_t>>, public FramedRS485Listener {
+ public:
+  void handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) override {
+    this->trigger(payload);
+  }
+};
+
 class FramedRS485Hub : public Component, public uart::UARTDevice {
  public:
   void setup() override;
@@ -112,7 +105,6 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   void set_tx_fixed_interval(uint32_t interval) { this->tx_fixed_interval_ = interval; }
   void set_queue_policy(QueuePolicy policy) { this->queue_policy_ = policy; }
   void set_max_queue_size(uint32_t size) { this->max_queue_size_ = size; }
-  void set_tx_guard_time(uint32_t guard_time) { this->tx_guard_time_ = guard_time; }
   void set_key_format(KeyFormat format) { this->key_format_ = format; }
   void set_idle_command(uint32_t cmd) {
     this->idle_command_ = cmd;
@@ -121,7 +113,6 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   void set_dump_frames(bool dump_frames) { this->dump_frames_ = dump_frames; }
   void set_sniffer_only(bool sniffer_only) { this->sniffer_only_ = sniffer_only; }
   void set_max_frame_length(uint32_t length) { this->max_frame_length_ = length; }
-  void set_flow_control_pin(GPIOPin *pin) { this->flow_control_pin_ = pin; }
   void set_in_frame_timeout(uint32_t ms) { this->in_frame_timeout_ms_ = ms; }
 
   bool queue_command_value(uint32_t command);
@@ -138,17 +129,6 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   }
   const char *get_last_frame_type() const { return this->last_frame_type_; }
 
-  // Hayward AquaLogic protocol helpers — included for convenience.
-  // These operate on the LED status frame (type 0x0102) and display frame (type 0x0103).
-  static uint32_t decode_led_mask(const std::vector<uint8_t> &payload);
-  static uint32_t decode_led_mask_blinking(const std::vector<uint8_t> &payload);
-  /// Strips blink bits, substitutes degree sign, and trims whitespace from a display payload.
-  static void decode_display_text(const std::vector<uint8_t> &payload, std::string &out);
-  /// Returns only the characters with bit 7 set (blinking glyphs); empty when nothing blinks.
-  static void decode_display_blink_text(const std::vector<uint8_t> &payload, std::string &out);
-  /// Collapses whitespace runs to a single space and trims ends (display centering absorption).
-  static std::string normalize_display_ws(const std::string &s);
-
  protected:
   void read_uart_(uint32_t now);
   void process_raw_frame_(uint32_t now);
@@ -161,8 +141,6 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   void maybe_tx_(uint32_t now);
   void send_next_(uint32_t now);
   void send_next_idle_(uint32_t now);
-  void set_tx_mode_(bool tx);
-  void release_tx_();
   bool frame_type_equals_(const std::vector<uint8_t> &payload, const std::vector<uint8_t> &frame_type) const;
   void update_last_frame_type_();
   size_t queue_size_() const { return this->tx_queue_.size() - this->tx_queue_head_; }
@@ -183,7 +161,6 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   uint32_t tx_fixed_interval_{100};
   QueuePolicy queue_policy_{QUEUE_REPLACE_LATEST};
   uint32_t max_queue_size_{1};
-  uint32_t tx_guard_time_{5};
   KeyFormat key_format_{KEY_FORMAT_WIRELESS_9BYTE};
   uint32_t idle_command_{0};
   bool has_idle_command_{false};
@@ -192,7 +169,6 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   uint32_t max_frame_length_{128};
   uint32_t in_frame_timeout_ms_{50};
 
-  GPIOPin *flow_control_pin_{nullptr};
   std::vector<FramedRS485Listener *> listeners_;
   std::vector<std::vector<uint8_t>> tx_queue_;
   size_t tx_queue_head_{0};
@@ -205,8 +181,6 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   uint32_t last_ka_time_{0};
   uint32_t last_keepalive_ms_{0};
   uint32_t last_tx_time_{0};
-  bool tx_release_pending_{false};
-  uint32_t tx_release_at_{0};
   bool tx_start_pending_{false};
   uint32_t tx_start_at_{0};
   std::vector<uint8_t> pending_tx_frame_;

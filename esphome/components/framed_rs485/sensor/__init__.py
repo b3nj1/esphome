@@ -7,7 +7,6 @@ from .. import (
     CONF_DECODE,
     CONF_FRAME_TYPE,
     CONF_FRAMED_RS485_ID,
-    CONF_TEMPERATURE_LABEL,
     SENSOR_DECODES,
     FramedRS485Hub,
     framed_rs485_ns,
@@ -31,7 +30,6 @@ CONFIG_SCHEMA = sensor.sensor_schema(
             *SENSOR_DECODES, lower=True
         ),
         cv.Optional(CONF_OFFSET, default=0): cv.positive_int,
-        cv.Optional(CONF_TEMPERATURE_LABEL, default=""): cv.string_strict,
         cv.Optional(CONF_LAMBDA): cv.returning_lambda,
     }
 )
@@ -43,7 +41,6 @@ async def to_code(config):
 
     cg.add(var.set_decode(SENSOR_DECODES[config[CONF_DECODE]]))
     cg.add(var.set_offset(config[CONF_OFFSET]))
-    cg.add(var.set_temperature_label(config[CONF_TEMPERATURE_LABEL].lower()))
 
     if CONF_LAMBDA in config:
         template_ = await cg.process_lambda(

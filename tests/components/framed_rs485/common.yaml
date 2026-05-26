@@ -1,9 +1,31 @@
+globals:
+  - id: g_led_mask
+    type: uint32_t
+    initial_value: "0"
+
 framed_rs485:
   - id: framed_rs485_hub
     uart_id: uart_bus
     profile: generic_framed_rs485
     dump_frames: true
     frame_timeout: 50ms
+    on_frame:
+      # Decode a 32-bit little-endian bitmask and push to template binary sensors.
+      - frame_type: [0x01, 0x02]
+        then:
+          - lambda: |-
+              if (payload.size() < 6) return;
+              uint32_t mask = uint32_t(payload[2]) | (uint32_t(payload[3]) << 8) |
+                              (uint32_t(payload[4]) << 16) | (uint32_t(payload[5]) << 24);
+              id(g_led_mask) = mask;
+              id(on_frame_bit0).publish_state(bool(mask & (1UL << 0)));
+              id(on_frame_bit1).publish_state(bool(mask & (1UL << 1)));
+      # Match all frames: write the first payload byte to a global.
+      - frame_type: []
+        then:
+          - lambda: |-
+              if (!payload.empty())
+                id(g_led_mask) = payload[0];
 
   # Second instance: sniffer-only with idle_gap gate and CRC16-Modbus
   - id: framed_rs485_hub2
@@ -18,7 +40,6 @@ framed_rs485:
       gate:
         mode: idle_gap
         min_silence: 10ms
-      tx_guard_time: 5ms
       queue_policy: fifo
       max_queue_size: 4
 
@@ -34,22 +55,51 @@ framed_rs485:
         interval: 500ms
 
 binary_sensor:
+  # Template sensors driven by on_frame: above — no per-sensor lambda needed.
+  - platform: template
+    id: on_frame_bit0
+    name: "On Frame Bit 0"
+
+  - platform: template
+    id: on_frame_bit1
+    name: "On Frame Bit 1"
+
+  # Lambda mode: read bit 0 of a 32-bit little-endian mask at bytes 2-5.
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
     name: "Lights"
     frame_type: [0x01, 0x02]
-    decode: led_bit
-    bit: 0
+    lambda: |-
+      if (payload.size() < 6) return {};
+      uint32_t mask = uint32_t(payload[2]) | (uint32_t(payload[3]) << 8) |
+                      (uint32_t(payload[4]) << 16) | (uint32_t(payload[5]) << 24);
+      return bool(mask & (1UL << 0));
 
+  # Latching text-match mode with a custom text extractor.
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
     name: "Heater Auto Mode"
     frame_type: [0x01, 0x03]
-    decode: display_text_match
+    text_lambda: |-
+      std::string out;
+      for (size_t i = 3; i < payload.size(); i++) {
+        uint8_t b = payload[i];
+        if (b >= 0x20 && b < 0x7F) out.push_back(char(b));
+      }
+      return out;
     match_on: ["Heater", "Auto"]
     match_off: ["Heater", "Manual"]
     timeout: 60s
 
+  # Latching text-match using the default ASCII extractor (no text_lambda).
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Pump Running"
+    frame_type: [0x01, 0x04]
+    match_on: ["Pump"]
+    match_off: ["Idle"]
+
+  # Direct lambda returning optional<bool>.
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
     name: "Custom Flag"
@@ -59,13 +109,38 @@ binary_sensor:
       return bool(payload[2] & 0x01);
 
 sensor:
+  # Lambda decode: read a signed byte and publish as float.
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
     name: "Pool Temp"
     frame_type: [0x01, 0x03]
-    decode: display_temperature
-    temperature_label: pool
+    lambda: |-
+      if (payload.size() < 4) return {};
+      return float(int8_t(payload[3]));
 
+  # Built-in generic decode modes.
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Raw Uint8"
+    frame_type: [0x01, 0x05]
+    decode: uint8
+    offset: 2
+
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Raw Uint16 BE"
+    frame_type: [0x01, 0x06]
+    decode: uint16_be
+    offset: 2
+
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "BCD Value"
+    frame_type: [0x01, 0x07]
+    decode: bcd
+    offset: 2
+
+  # Diagnostic counters.
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
     name: "CRC Failures"
@@ -82,23 +157,35 @@ sensor:
     entity_category: diagnostic
 
 text_sensor:
+  # Lambda decode: strip non-printable bytes and return ASCII string.
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
     name: "Display"
     frame_type: [0x01, 0x03]
-    decode: display_text
+    lambda: |-
+      std::string out;
+      for (auto b : payload)
+        if (b >= 0x20 && b < 0x7F) out.push_back(char(b));
+      return out;
 
+  # Lambda decode: strip blink bits (bit 7) before extracting ASCII.
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
-    name: "Display Blink"
+    name: "Display With Blink"
     frame_type: [0x01, 0x03]
-    decode: display_blink_text
+    lambda: |-
+      std::string out;
+      for (auto b : payload) {
+        uint8_t c = b & 0x7F;
+        if (c >= 0x20 && c < 0x7F) out.push_back(char(c));
+      }
+      return out;
 
+  # Built-in: publish the last received frame type as hex (e.g. "01 02").
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
     name: "Last Frame Type"
     frame_type: []
-    decode: last_frame_type
     entity_category: diagnostic
 
 button:

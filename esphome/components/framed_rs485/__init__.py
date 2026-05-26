@@ -1,4 +1,4 @@
-from esphome import pins
+from esphome import automation
 import esphome.codegen as cg
 from esphome.components import uart
 from esphome.components.const import CONF_DATA_BITS, CONF_PARITY, CONF_STOP_BITS
@@ -6,10 +6,10 @@ import esphome.config_validation as cv
 from esphome.const import (
     CONF_BAUD_RATE,
     CONF_DELAY,
-    CONF_FLOW_CONTROL_PIN,
     CONF_ID,
     CONF_INTERVAL,
     CONF_MODE,
+    CONF_TRIGGER_ID,
     CONF_TYPE,
     CONF_UART_ID,
 )
@@ -22,10 +22,12 @@ MULTI_CONF = True
 
 framed_rs485_ns = cg.esphome_ns.namespace("framed_rs485")
 FramedRS485Hub = framed_rs485_ns.class_("FramedRS485Hub", cg.Component, uart.UARTDevice)
+FramedRS485FrameTrigger = framed_rs485_ns.class_(
+    "FramedRS485FrameTrigger",
+    automation.Trigger.template(cg.std_vector.template(cg.uint8)),
+)
 
 SensorDecode = framed_rs485_ns.enum("SensorDecode")
-BinaryDecode = framed_rs485_ns.enum("BinaryDecode")
-TextDecode = framed_rs485_ns.enum("TextDecode")
 KeyFormat = framed_rs485_ns.enum("KeyFormat")
 CrcVariant = framed_rs485_ns.enum("CrcVariant")
 CrcType = framed_rs485_ns.enum("CrcType")
@@ -33,7 +35,6 @@ QueuePolicy = framed_rs485_ns.enum("QueuePolicy")
 TxGateMode = framed_rs485_ns.enum("TxGateMode")
 
 CONF_FRAMED_RS485_ID = "framed_rs485_id"
-CONF_BIT = "bit"
 CONF_CRC = "crc"
 CONF_DECODE = "decode"
 CONF_DLE = "dle"
@@ -55,10 +56,10 @@ CONF_SNIFFER_ONLY = "sniffer_only"
 CONF_STX = "stx"
 CONF_MATCH_ON = "match_on"
 CONF_MATCH_OFF = "match_off"
-CONF_TEMPERATURE_LABEL = "temperature_label"
+CONF_ON_FRAME = "on_frame"
+CONF_TEXT_LAMBDA = "text_lambda"
 CONF_IDLE_COMMAND = "idle_command"
 CONF_TX = "tx"
-CONF_TX_GUARD_TIME = "tx_guard_time"
 CONF_TX_VARIANT = "tx_variant"
 
 PROFILE_HAYWARD_WIRELESS = "hayward_aqualogic_wireless"
@@ -99,43 +100,18 @@ TX_GATE_MODES = {
 }
 
 SENSOR_DECODES = {
-    "led_mask": SensorDecode.SENSOR_DECODE_LED_MASK,
-    "led_mask_blinking": SensorDecode.SENSOR_DECODE_LED_MASK_BLINKING,
-    "display_temperature": SensorDecode.SENSOR_DECODE_DISPLAY_TEMPERATURE,
     "uint8": SensorDecode.SENSOR_DECODE_UINT8,
     "uint16_be": SensorDecode.SENSOR_DECODE_UINT16_BE,
     "uint16_le": SensorDecode.SENSOR_DECODE_UINT16_LE,
     "uint32_be": SensorDecode.SENSOR_DECODE_UINT32_BE,
     "uint32_le": SensorDecode.SENSOR_DECODE_UINT32_LE,
     "bcd": SensorDecode.SENSOR_DECODE_BCD,
-    "vsp_speed_request": SensorDecode.SENSOR_DECODE_VSP_SPEED_REQUEST,
-    "vsp_power_bcd": SensorDecode.SENSOR_DECODE_VSP_POWER_BCD,
     "frames_received": SensorDecode.SENSOR_DECODE_FRAMES_RECEIVED,
     "crc_failures": SensorDecode.SENSOR_DECODE_CRC_FAILURES,
     "commands_sent": SensorDecode.SENSOR_DECODE_COMMANDS_SENT,
     "command_drops": SensorDecode.SENSOR_DECODE_COMMAND_DROPS,
     "last_keepalive_ms": SensorDecode.SENSOR_DECODE_LAST_KEEPALIVE_MS,
     "queue_depth": SensorDecode.SENSOR_DECODE_QUEUE_DEPTH,
-}
-
-BINARY_DECODES = {
-    "led_bit": BinaryDecode.BINARY_DECODE_LED_BIT,
-    "display_text_match": BinaryDecode.BINARY_DECODE_DISPLAY_TEXT_MATCH,
-}
-
-TEXT_DECODES = {
-    "display_text": TextDecode.TEXT_DECODE_DISPLAY_TEXT,
-    "display_blink_text": TextDecode.TEXT_DECODE_DISPLAY_BLINK_TEXT,
-    "last_frame_type": TextDecode.TEXT_DECODE_LAST_FRAME_TYPE,
-}
-
-_DIAGNOSTIC_SENSOR_DECODES = {
-    "frames_received",
-    "crc_failures",
-    "commands_sent",
-    "command_drops",
-    "last_keepalive_ms",
-    "queue_depth",
 }
 
 
@@ -201,7 +177,10 @@ TX_GATE_SCHEMA = cv.Schema(
         cv.Optional(CONF_MODE, default="frame_trigger"): cv.one_of(
             *TX_GATE_MODES, lower=True
         ),
-        cv.Optional(CONF_FRAME_TYPE, default=[0x01, 0x01]): validate_frame_type,
+        # Schema caps gate.frame_type at 8 bytes to match the fixed dump_config buffer.
+        cv.Optional(CONF_FRAME_TYPE, default=[0x01, 0x01]): cv.All(
+            validate_frame_type, cv.Length(max=8)
+        ),
         # delay=0 is valid (no delay after the gate frame before transmitting).
         cv.Optional(CONF_DELAY, default="0ms"): cv.positive_time_period_milliseconds,
         cv.Optional(
@@ -220,9 +199,6 @@ TX_SCHEMA = cv.Schema(
             *QUEUE_POLICIES, lower=True
         ),
         cv.Optional(CONF_MAX_QUEUE_SIZE, default=1): cv.positive_int,
-        cv.Optional(
-            CONF_TX_GUARD_TIME, default="5ms"
-        ): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_IDLE_COMMAND): validate_u32,
     }
 )
@@ -264,7 +240,6 @@ CONFIG_SCHEMA = cv.All(
                 PROFILE_GENERIC,
                 lower=True,
             ),
-            cv.Optional(CONF_FLOW_CONTROL_PIN): pins.gpio_output_pin_schema,
             cv.Optional(CONF_FRAMING, default={}): FRAMING_SCHEMA,
             cv.Optional(CONF_CRC, default={}): CRC_SCHEMA,
             cv.Optional(CONF_TX, default={}): TX_SCHEMA,
@@ -275,6 +250,14 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(
                 CONF_FRAME_TIMEOUT, default="50ms"
             ): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_ON_FRAME): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(
+                        FramedRS485FrameTrigger
+                    ),
+                    cv.Required(CONF_FRAME_TYPE): validate_frame_type,
+                }
+            ),
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
@@ -363,7 +346,6 @@ async def to_code(config):
     cg.add(var.set_tx_fixed_interval(gate[CONF_INTERVAL].total_milliseconds))
     cg.add(var.set_queue_policy(QUEUE_POLICIES[tx[CONF_QUEUE_POLICY]]))
     cg.add(var.set_max_queue_size(tx[CONF_MAX_QUEUE_SIZE]))
-    cg.add(var.set_tx_guard_time(tx[CONF_TX_GUARD_TIME].total_milliseconds))
     if (idle_cmd := tx.get(CONF_IDLE_COMMAND)) is not None:
         cg.add(var.set_idle_command(idle_cmd))
 
@@ -373,6 +355,17 @@ async def to_code(config):
     cg.add(var.set_max_frame_length(config[CONF_MAX_FRAME_LENGTH]))
     cg.add(var.set_in_frame_timeout(config[CONF_FRAME_TIMEOUT].total_milliseconds))
 
-    if (flow_pin_cfg := config.get(CONF_FLOW_CONTROL_PIN)) is not None:
-        pin = await cg.gpio_pin_expression(flow_pin_cfg)
-        cg.add(var.set_flow_control_pin(pin))
+    for conf in config.get(CONF_ON_FRAME, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
+        cg.add(trigger.set_frame_type(conf[CONF_FRAME_TYPE]))
+        cg.add(var.register_listener(trigger))
+        await automation.build_automation(
+            trigger,
+            [
+                (
+                    cg.std_vector.template(cg.uint8).operator("const").operator("ref"),
+                    "payload",
+                )
+            ],
+            conf,
+        )

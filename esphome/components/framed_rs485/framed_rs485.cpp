@@ -77,10 +77,6 @@ bool FramedRS485Listener::matches(const std::vector<uint8_t> &payload) const {
 }
 
 void FramedRS485Hub::setup() {
-  if (this->flow_control_pin_ != nullptr) {
-    this->flow_control_pin_->setup();
-    this->flow_control_pin_->digital_write(false);  // start in RX mode
-  }
   if (this->tx_gate_mode_ == TX_GATE_FRAME_TRIGGER && this->tx_gate_frame_type_.empty() && !this->sniffer_only_) {
     ESP_LOGW(TAG, "TX gate mode is frame_trigger but gate.frame_type is empty — TX will never fire; "
                   "use idle_gap or fixed_delay instead");
@@ -112,7 +108,6 @@ void FramedRS485Hub::loop() {
   // Unsigned subtraction wraps correctly so this comparison handles the 49-day millis rollover.
   if (this->tx_start_pending_ && now - this->tx_start_at_ < 0x80000000UL) {
     this->tx_start_pending_ = false;
-    this->set_tx_mode_(true);
     this->write_array(this->pending_tx_frame_);
     this->flush();
     ESP_LOGD(TAG, "TX %s",
@@ -120,13 +115,6 @@ void FramedRS485Hub::loop() {
                                                             // compiled out in non-debug builds; frame size is variable
     this->last_tx_time_ = now;
     this->commands_sent_++;
-    this->tx_release_at_ = now + this->tx_guard_time_;
-    this->tx_release_pending_ = true;
-    if (this->tx_guard_time_ == 0)
-      this->release_tx_();
-  }
-  if (this->tx_release_pending_ && now - this->tx_release_at_ < 0x80000000UL) {
-    this->release_tx_();
   }
 }
 
@@ -136,16 +124,14 @@ void FramedRS485Hub::dump_config() {
                 this->escape_byte_);
   ESP_LOGCONFIG(TAG, "  CRC type: %s, accept header CRC: %s, accept payload CRC: %s", crc_type_str(this->crc_type_),
                 YESNO(this->accept_header_crc_), YESNO(this->accept_payload_crc_));
-  char gate_hex[format_hex_size(8)];  // gate frame type is at most a few bytes; 8 is generous
+  char gate_hex[format_hex_size(8)];  // schema caps gate.frame_type to 8 bytes
   format_hex_to(gate_hex, this->tx_gate_frame_type_.data(), this->tx_gate_frame_type_.size());
   ESP_LOGCONFIG(TAG, "  TX gate: %s, gate frame: %s, gate delay: %ums", tx_gate_mode_str(this->tx_gate_mode_), gate_hex,
                 this->tx_gate_delay_);
-  ESP_LOGCONFIG(TAG, "  TX idle gap: %ums, TX interval: %ums, guard: %ums", this->tx_idle_gap_,
-                this->tx_fixed_interval_, this->tx_guard_time_);
+  ESP_LOGCONFIG(TAG, "  TX idle gap: %ums, TX interval: %ums", this->tx_idle_gap_, this->tx_fixed_interval_);
   ESP_LOGCONFIG(TAG, "  Queue policy: %s, queue size: %u", queue_policy_str(this->queue_policy_),
                 this->max_queue_size_);
   ESP_LOGCONFIG(TAG, "  Sniffer only: %s, dump frames: %s", YESNO(this->sniffer_only_), YESNO(this->dump_frames_));
-  LOG_PIN("  Flow Control Pin: ", this->flow_control_pin_);
 }
 
 void FramedRS485Hub::set_framing(uint8_t dle, uint8_t stx, uint8_t etx, uint8_t escape_byte) {
@@ -427,7 +413,7 @@ void FramedRS485Hub::build_key_payload_(uint32_t command, std::vector<uint8_t> &
 }
 
 void FramedRS485Hub::maybe_tx_(uint32_t now) {
-  if (this->sniffer_only_ || this->queue_size_() == 0 || this->tx_start_pending_ || this->tx_release_pending_)
+  if (this->sniffer_only_ || this->queue_size_() == 0 || this->tx_start_pending_)
     return;
   if (this->tx_gate_mode_ == TX_GATE_IDLE_GAP && this->last_rx_time_ != 0 &&
       now - this->last_rx_time_ >= this->tx_idle_gap_)
@@ -450,7 +436,7 @@ void FramedRS485Hub::send_next_(uint32_t now) {
   if (this->sniffer_only_ || this->tx_start_pending_)
     return;
   if (this->queue_size_() == 0) {
-    if (this->has_idle_command_ && !this->tx_release_pending_)
+    if (this->has_idle_command_)
       this->send_next_idle_(now);
     return;
   }
@@ -465,7 +451,6 @@ void FramedRS485Hub::send_next_(uint32_t now) {
 
   {
     const auto &frame = this->tx_queue_[this->tx_queue_head_];
-    this->set_tx_mode_(true);
     this->write_array(frame);
     this->flush();
     ESP_LOGD(TAG, "TX %s", format_hex(frame).c_str());  // NOLINT(cppcoreguidelines-pro-type-vararg): debug path,
@@ -474,10 +459,6 @@ void FramedRS485Hub::send_next_(uint32_t now) {
   this->queue_pop_front_();
   this->last_tx_time_ = now;
   this->commands_sent_++;
-  this->tx_release_at_ = now + this->tx_guard_time_;
-  this->tx_release_pending_ = true;
-  if (this->tx_guard_time_ == 0)
-    this->release_tx_();
 }
 
 void FramedRS485Hub::send_next_idle_(uint32_t now) {
@@ -489,15 +470,10 @@ void FramedRS485Hub::send_next_idle_(uint32_t now) {
     this->tx_start_pending_ = true;
     return;
   }
-  this->set_tx_mode_(true);
   this->write_array(this->tx_frame_buf_);
   this->flush();
   this->last_tx_time_ = now;
   this->commands_sent_++;
-  this->tx_release_at_ = now + this->tx_guard_time_;
-  this->tx_release_pending_ = true;
-  if (this->tx_guard_time_ == 0)
-    this->release_tx_();
   ESP_LOGD(TAG, "TX idle %s",
            format_hex(this->tx_frame_buf_).c_str());  // NOLINT(cppcoreguidelines-pro-type-vararg): debug path, compiled
                                                       // out in non-debug builds; frame size is variable
@@ -532,16 +508,6 @@ bool FramedRS485Hub::queue_raw_frame(const std::vector<uint8_t> &payload) {
   return true;
 }
 
-void FramedRS485Hub::set_tx_mode_(bool tx) {
-  if (this->flow_control_pin_ != nullptr)
-    this->flow_control_pin_->digital_write(tx);
-}
-
-void FramedRS485Hub::release_tx_() {
-  this->tx_release_pending_ = false;
-  this->set_tx_mode_(false);
-}
-
 bool FramedRS485Hub::frame_type_equals_(const std::vector<uint8_t> &payload,
                                         const std::vector<uint8_t> &frame_type) const {
   if (frame_type.empty() || payload.size() < frame_type.size())
@@ -554,91 +520,27 @@ void FramedRS485Hub::update_last_frame_type_() {
   format_hex_to(this->last_frame_type_, this->rx_payload_.data(), len);
 }
 
-uint32_t FramedRS485Hub::decode_led_mask(const std::vector<uint8_t> &payload) {
-  if (payload.size() < 6)
-    return 0;
-  return static_cast<uint32_t>(payload[2]) | (static_cast<uint32_t>(payload[3]) << 8) |
-         (static_cast<uint32_t>(payload[4]) << 16) | (static_cast<uint32_t>(payload[5]) << 24);
-}
-
-uint32_t FramedRS485Hub::decode_led_mask_blinking(const std::vector<uint8_t> &payload) {
-  if (payload.size() < 10)
-    return 0;
-  return static_cast<uint32_t>(payload[6]) | (static_cast<uint32_t>(payload[7]) << 8) |
-         (static_cast<uint32_t>(payload[8]) << 16) | (static_cast<uint32_t>(payload[9]) << 24);
-}
-
-void FramedRS485Hub::decode_display_text(const std::vector<uint8_t> &payload, std::string &out) {
-  out.clear();
-  // Display payload starts at byte 3; bytes 0-2 are frame header fields.
-  if (payload.size() <= 3)
-    return;
-  for (size_t i = 3; i < payload.size(); i++) {
-    uint8_t b = payload[i];
-    if (b > 0x7F)
-      b -= 0x80;  // strip blink bit — same glyph whether blinking or solid
-    if (b == 0)
-      continue;
-    if (b == '_') {
-      out += "\xC2\xB0";  // '_' encodes the degree symbol on AquaLogic displays
-    } else {
-      out.push_back(static_cast<char>(b));
-    }
-  }
-  while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back())))
-    out.pop_back();
-  size_t start = 0;
-  while (start < out.size() && std::isspace(static_cast<unsigned char>(out[start])))
-    start++;
-  if (start > 0)
-    out.erase(0, start);
-}
-
-void FramedRS485Hub::decode_display_blink_text(const std::vector<uint8_t> &payload, std::string &out) {
-  out.clear();
-  // Same layout as decode_display_text, but only emit characters that had bit 7 set
-  // (i.e., were blinking on the physical display). Returns empty when nothing blinks.
-  if (payload.size() <= 3)
-    return;
-  for (size_t i = 3; i < payload.size(); i++) {
-    uint8_t b = payload[i];
-    if (b <= 0x7F)
-      continue;  // solid character — not blinking
-    b -= 0x80;
-    if (b == 0)
-      continue;
-    if (b == '_') {
-      out += "\xC2\xB0";
-    } else {
-      out.push_back(static_cast<char>(b));
-    }
-  }
-  while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back())))
-    out.pop_back();
-  size_t start = 0;
-  while (start < out.size() && std::isspace(static_cast<unsigned char>(out[start])))
-    start++;
-  if (start > 0)
-    out.erase(0, start);
-}
-
-std::string FramedRS485Hub::normalize_display_ws(const std::string &s) {
-  std::string out;
-  // Start in_space=true so leading whitespace is skipped without special casing.
-  bool in_space = true;
-  for (char c : s) {
+/// Collapses whitespace runs to a single space and trims both ends, in-place.
+/// Two-pointer approach: writes back into the same buffer, no heap allocation.
+static void normalize_display_ws(std::string &s) {
+  size_t write = 0;
+  bool in_space = true;  // start true so leading whitespace is dropped without special-casing
+  for (size_t i = 0; i < s.size(); i++) {
+    char c = s[i];
     if (std::isspace(static_cast<unsigned char>(c))) {
-      if (!in_space)
-        out.push_back(' ');
-      in_space = true;
+      if (!in_space) {
+        s[write++] = ' ';
+        in_space = true;
+      }
     } else {
-      out.push_back(c);
+      s[write++] = c;
       in_space = false;
     }
   }
-  if (!out.empty() && out.back() == ' ')
-    out.pop_back();
-  return out;
+  // Drop any trailing space written just before the final whitespace run.
+  if (write > 0 && s[write - 1] == ' ')
+    write--;
+  s.resize(write);
 }
 
 #ifdef USE_BUTTON
@@ -647,10 +549,15 @@ void FramedRS485Button::press_action() { this->parent_->queue_command_value(this
 
 #ifdef USE_BINARY_SENSOR
 void FramedRS485BinarySensor::add_match_on(const std::string &s) {
-  this->match_on_.push_back(FramedRS485Hub::normalize_display_ws(s));
+  // Normalize at setup time so the hot path never allocates a second string.
+  std::string normalized = s;
+  normalize_display_ws(normalized);
+  this->match_on_.push_back(std::move(normalized));
 }
 void FramedRS485BinarySensor::add_match_off(const std::string &s) {
-  this->match_off_.push_back(FramedRS485Hub::normalize_display_ws(s));
+  std::string normalized = s;
+  normalize_display_ws(normalized);
+  this->match_off_.push_back(std::move(normalized));
 }
 
 // Returns true if all needles appear (case-insensitive substring) in haystack.
@@ -666,6 +573,7 @@ static bool all_match(const std::string &haystack, const std::vector<std::string
 }
 
 void FramedRS485BinarySensor::handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) {
+  // Mode 1: fully custom stateless decode.
   if (this->lambda_ != nullptr) {
     auto value = this->lambda_(payload);
     if (value.has_value())
@@ -673,41 +581,47 @@ void FramedRS485BinarySensor::handle_frame(FramedRS485Hub *hub, const std::vecto
     return;
   }
 
-  if (this->decode_ == BINARY_DECODE_LED_BIT) {
-    uint32_t mask = FramedRS485Hub::decode_led_mask(payload);
-    this->publish_state((mask & (1UL << this->bit_)) != 0);
+  // Mode 2: latching text match.
+  // Extract a string from the payload, then apply match_on/match_off/timeout latch logic.
+  std::string text;
+  if (this->text_lambda_ != nullptr) {
+    auto result = this->text_lambda_(payload);
+    if (!result.has_value())
+      return;  // text_lambda signalled "skip this frame"
+    text = std::move(result.value());
+  } else {
+    // Default: printable ASCII bytes from the full payload, null bytes skipped.
+    // Suitable for devices that broadcast plain ASCII strings. Override with
+    // text_lambda: for devices that encode text with protocol-specific flags.
+    for (auto b : payload) {
+      if (b >= 0x20 && b < 0x7F)
+        text.push_back(static_cast<char>(b));
+    }
+  }
+  normalize_display_ws(text);
+
+  // Proof positive: all match_on strings present — latch true.
+  if (!this->match_on_.empty() && all_match(text, this->match_on_)) {
+    this->last_proof_ms_ = now;
+    this->timed_out_ = false;
+    this->publish_state(true);
     return;
   }
 
-  if (this->decode_ == BINARY_DECODE_DISPLAY_TEXT_MATCH) {
-    std::string text;
-    FramedRS485Hub::decode_display_text(payload, text);
-    text = FramedRS485Hub::normalize_display_ws(text);
+  // Proof negative: all match_off strings present — latch false.
+  if (!this->match_off_.empty() && all_match(text, this->match_off_)) {
+    this->last_proof_ms_ = now;
+    this->timed_out_ = false;
+    this->publish_state(false);
+    return;
+  }
 
-    // Proof positive: all match_on strings present — latch true.
-    if (!this->match_on_.empty() && all_match(text, this->match_on_)) {
-      this->last_proof_ms_ = now;
-      this->timed_out_ = false;
-      this->publish_state(true);
-      return;
-    }
-
-    // Proof negative: all match_off strings present — latch false.
-    if (!this->match_off_.empty() && all_match(text, this->match_off_)) {
-      this->last_proof_ms_ = now;
-      this->timed_out_ = false;
+  // Neither proof seen — check timeout.
+  // last_proof_ms_ == 0 means no proof yet; do not expire before the first known state.
+  if (this->timeout_ms_ > 0 && this->last_proof_ms_ != 0 && !this->timed_out_) {
+    if (now - this->last_proof_ms_ >= this->timeout_ms_) {
+      this->timed_out_ = true;
       this->publish_state(false);
-      return;
-    }
-
-    // Neither proof seen on this frame — check timeout.
-    // last_proof_ms_ == 0 means we have not seen any proof yet; don't expire before
-    // the sensor has ever had a known state.
-    if (this->timeout_ms_ > 0 && this->last_proof_ms_ != 0 && !this->timed_out_) {
-      if (now - this->last_proof_ms_ >= this->timeout_ms_) {
-        this->timed_out_ = true;
-        this->publish_state(false);
-      }
     }
   }
 }
@@ -716,57 +630,6 @@ void FramedRS485BinarySensor::handle_frame(FramedRS485Hub *hub, const std::vecto
 #ifdef USE_SENSOR
 optional<float> FramedRS485Sensor::decode_builtin_(FramedRS485Hub *hub, const std::vector<uint8_t> &payload) const {
   switch (this->decode_) {
-    case SENSOR_DECODE_LED_MASK:
-      return static_cast<float>(FramedRS485Hub::decode_led_mask(payload));
-    case SENSOR_DECODE_LED_MASK_BLINKING:
-      return static_cast<float>(FramedRS485Hub::decode_led_mask_blinking(payload));
-    case SENSOR_DECODE_DISPLAY_TEMPERATURE: {
-      std::string text;
-      FramedRS485Hub::decode_display_text(payload, text);
-      // Locate the label first so that multi-temperature displays ("Air 68F Pool 84F")
-      // return the digit nearest the label rather than the first digit in the string.
-      size_t scan_from = 0;
-      if (!this->temperature_label_.empty()) {
-        size_t pos = std::string::npos;
-        for (size_t p = 0; p + this->temperature_label_.size() <= text.size(); p++) {
-          bool match = true;
-          for (size_t j = 0; j < this->temperature_label_.size() && match; j++) {
-            if (std::tolower(static_cast<unsigned char>(text[p + j])) !=
-                std::tolower(static_cast<unsigned char>(this->temperature_label_[j])))
-              match = false;
-          }
-          if (match) {
-            pos = p;
-            break;
-          }
-        }
-        if (pos == std::string::npos)
-          return {};
-        scan_from = pos;
-      }
-      for (size_t i = scan_from; i < text.size(); i++) {
-        if (!std::isdigit(static_cast<unsigned char>(text[i])))
-          continue;
-        size_t end = i;
-        while (end < text.size() && std::isdigit(static_cast<unsigned char>(text[end])))
-          end++;
-        size_t limit = std::min(end + 3, text.size());
-        bool has_unit = false;
-        for (size_t j = end; j < limit && !has_unit; j++) {
-          char lc = static_cast<char>(std::tolower(static_cast<unsigned char>(text[j])));
-          if (lc == 'f' || lc == 'c') {
-            has_unit = true;
-          } else if (j + 1 < limit && static_cast<unsigned char>(text[j]) == 0xC2 &&
-                     static_cast<unsigned char>(text[j + 1]) == 0xB0) {
-            has_unit = true;
-          }
-        }
-        if (has_unit)
-          return static_cast<float>(std::strtol(&text[i], nullptr, 10));
-        i = end;
-      }
-      return {};
-    }
     case SENSOR_DECODE_UINT8:
       if (payload.size() <= this->offset_)
         return {};
@@ -797,15 +660,6 @@ optional<float> FramedRS485Sensor::decode_builtin_(FramedRS485Hub *hub, const st
       if (payload.size() <= this->offset_)
         return {};
       return static_cast<float>(((payload[this->offset_] & 0xF0) >> 4) * 10 + (payload[this->offset_] & 0x0F));
-    case SENSOR_DECODE_VSP_SPEED_REQUEST:
-      if (payload.size() < 4)
-        return {};
-      return static_cast<float>((static_cast<uint16_t>(payload[2]) << 8) | payload[3]);
-    case SENSOR_DECODE_VSP_POWER_BCD:
-      if (payload.size() < 7)
-        return {};
-      return static_cast<float>(((payload[5] & 0xF0) >> 4) * 1000 + (payload[5] & 0x0F) * 100 +
-                                ((payload[6] & 0xF0) >> 4) * 10 + (payload[6] & 0x0F));
     case SENSOR_DECODE_FRAMES_RECEIVED:
       return static_cast<float>(hub->get_frames_received());
     case SENSOR_DECODE_CRC_FAILURES:
@@ -834,17 +688,8 @@ void FramedRS485TextSensor::handle_frame(FramedRS485Hub *hub, const std::vector<
   optional<std::string> value;
   if (this->lambda_ != nullptr) {
     value = this->lambda_(payload);
-  } else if (this->decode_ == TEXT_DECODE_DISPLAY_TEXT) {
-    std::string text;
-    FramedRS485Hub::decode_display_text(payload, text);
-    value = std::move(text);
-  } else if (this->decode_ == TEXT_DECODE_DISPLAY_BLINK_TEXT) {
-    // Non-empty when any character on the display is blinking. On AquaLogic this
-    // typically indicates an alarm, a mode-change in progress, or a value being set.
-    std::string text;
-    FramedRS485Hub::decode_display_blink_text(payload, text);
-    value = std::move(text);
-  } else if (this->decode_ == TEXT_DECODE_LAST_FRAME_TYPE) {
+  } else {
+    // Only built-in mode: last_frame_type.
     value = std::string(hub->get_last_frame_type());
   }
   if (value.has_value())
