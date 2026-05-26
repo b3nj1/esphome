@@ -149,9 +149,13 @@ bool FramedRS485Hub::queue_command_value(uint32_t command) {
   }
   this->build_key_payload_(command, this->tx_payload_buf_);
   this->build_frame_(this->tx_payload_buf_, this->tx_frame_buf_);
+  return this->enqueue_frame_();
+}
+
+bool FramedRS485Hub::enqueue_frame_() {
   if (this->queue_policy_ == QUEUE_REPLACE_LATEST) {
     if (this->queue_size_() > 0 || this->tx_start_pending_) {
-      ESP_LOGW(TAG, "Replacing pending framed_rs485 command before it was transmitted");
+      ESP_LOGW(TAG, "Replacing pending framed_rs485 frame before it was transmitted");
       this->command_drops_++;
     }
     if (this->tx_start_pending_) {
@@ -162,7 +166,7 @@ bool FramedRS485Hub::queue_command_value(uint32_t command) {
     this->tx_queue_head_ = 0;
   } else {
     if (this->queue_size_() + (this->tx_start_pending_ ? 1 : 0) >= this->max_queue_size_) {
-      ESP_LOGW(TAG, "framed_rs485 command queue full; dropping new command");
+      ESP_LOGW(TAG, "framed_rs485 frame queue full; dropping frame");
       this->command_drops_++;
       return false;
     }
@@ -486,26 +490,7 @@ bool FramedRS485Hub::queue_raw_frame(const std::vector<uint8_t> &payload) {
     return false;
   }
   this->build_frame_(payload, this->tx_frame_buf_);
-  if (this->queue_policy_ == QUEUE_REPLACE_LATEST) {
-    if (this->queue_size_() > 0 || this->tx_start_pending_) {
-      ESP_LOGW(TAG, "Replacing pending framed_rs485 frame before it was transmitted");
-      this->command_drops_++;
-    }
-    if (this->tx_start_pending_) {
-      this->pending_tx_frame_ = this->tx_frame_buf_;
-      return true;
-    }
-    this->tx_queue_.clear();
-    this->tx_queue_head_ = 0;
-  } else {
-    if (this->queue_size_() + (this->tx_start_pending_ ? 1 : 0) >= this->max_queue_size_) {
-      ESP_LOGW(TAG, "framed_rs485 raw frame queue full; dropping frame");
-      this->command_drops_++;
-      return false;
-    }
-  }
-  this->tx_queue_.push_back(this->tx_frame_buf_);
-  return true;
+  return this->enqueue_frame_();
 }
 
 bool FramedRS485Hub::frame_type_equals_(const std::vector<uint8_t> &payload,
@@ -590,13 +575,16 @@ void FramedRS485BinarySensor::handle_frame(FramedRS485Hub *hub, const std::vecto
       return;  // text_lambda signalled "skip this frame"
     text = std::move(result.value());
   } else {
-    // Default: printable ASCII bytes from the full payload, null bytes skipped.
-    // Suitable for devices that broadcast plain ASCII strings. Override with
-    // text_lambda: for devices that encode text with protocol-specific flags.
+    // Default: printable ASCII bytes from the full payload.
+    // Build into a stack buffer first, then assign once to avoid push_back reallocation
+    // churn on payloads that exceed the SSO limit (~11-15 bytes on 32-bit libc++).
+    char buf[128];
+    size_t blen = 0;
     for (auto b : payload) {
-      if (b >= 0x20 && b < 0x7F)
-        text.push_back(static_cast<char>(b));
+      if (b >= 0x20 && b < 0x7F && blen < sizeof(buf))
+        buf[blen++] = static_cast<char>(b);
     }
+    text.assign(buf, blen);
   }
   normalize_display_ws(text);
 

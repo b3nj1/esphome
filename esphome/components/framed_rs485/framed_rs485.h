@@ -75,8 +75,8 @@ class FramedRS485Listener {
 };
 
 /// Automation trigger that fires when a framed RS-485 frame matching the configured
-/// frame_type is received. The payload (bytes after the two-byte frame type) is passed
-/// as the automation argument `payload`.
+/// frame_type is received. The full decoded payload is passed as the automation argument
+/// `payload`: bytes 0-1 are the two-byte frame type, bytes 2+ are the frame data.
 ///
 /// Registered with the hub via register_listener() — it is itself a listener.
 class FramedRS485FrameTrigger : public Trigger<std::vector<uint8_t>>, public FramedRS485Listener {
@@ -138,6 +138,7 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   void escape_dle_(const std::vector<uint8_t> &data, std::vector<uint8_t> &out) const;
   void build_frame_(const std::vector<uint8_t> &payload, std::vector<uint8_t> &out);
   void build_key_payload_(uint32_t command, std::vector<uint8_t> &out) const;
+  bool enqueue_frame_();
   void maybe_tx_(uint32_t now);
   void send_next_(uint32_t now);
   void send_next_idle_(uint32_t now);
