@@ -205,7 +205,6 @@ void FramedRS485Hub::read_uart_(uint32_t now) {
       this->in_frame_ = false;
       this->raw_frame_.clear();
     }
-    this->previous_byte_ = byte;
   }
 }
 
@@ -505,6 +504,11 @@ void FramedRS485Hub::update_last_frame_type_() {
   format_hex_to(this->last_frame_type_, this->rx_payload_.data(), len);
 }
 
+#ifdef USE_BUTTON
+void FramedRS485Button::press_action() { this->parent_->queue_command_value(this->command_value_); }
+#endif  // USE_BUTTON
+
+#ifdef USE_BINARY_SENSOR
 /// Collapses whitespace runs to a single space and trims both ends, in-place.
 /// Two-pointer approach: writes back into the same buffer, no heap allocation.
 static void normalize_display_ws(std::string &s) {
@@ -528,11 +532,6 @@ static void normalize_display_ws(std::string &s) {
   s.resize(write);
 }
 
-#ifdef USE_BUTTON
-void FramedRS485Button::press_action() { this->parent_->queue_command_value(this->command_value_); }
-#endif  // USE_BUTTON
-
-#ifdef USE_BINARY_SENSOR
 void FramedRS485BinarySensor::add_match_on(const std::string &s) {
   // Normalize at setup time so the hot path never allocates a second string.
   std::string normalized = s;

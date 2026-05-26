@@ -211,8 +211,6 @@ def validate_hub(config):
     if CONF_KEY_FORMAT not in config:
         config[CONF_KEY_FORMAT] = defaults[CONF_KEY_FORMAT]
 
-    if CONF_CRC not in config:
-        config[CONF_CRC] = {}
     if CONF_TX_VARIANT not in config[CONF_CRC]:
         config[CONF_CRC][CONF_TX_VARIANT] = defaults[CONF_TX_VARIANT]
     if CONF_TYPE in defaults and CONF_TYPE not in config[CONF_CRC]:
@@ -313,7 +311,6 @@ async def setup_listener(var, config):
     cg.add(var.set_frame_type(config[CONF_FRAME_TYPE]))
     hub = await cg.get_variable(config[CONF_FRAMED_RS485_ID])
     cg.add(hub.register_listener(var))
-    return hub
 
 
 async def to_code(config):

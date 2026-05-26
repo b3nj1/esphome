@@ -86,6 +86,9 @@ class FramedRS485FrameTrigger : public Trigger<std::vector<uint8_t>>, public Fra
   }
 };
 
+/// Central hub for a DLE-framed RS-485 bus. Owns the UART framer, TX queue,
+/// CRC engine, and listener registry. Subcomponents (sensors, buttons, etc.)
+/// register themselves via register_listener() and receive decoded frame payloads.
 class FramedRS485Hub : public Component, public uart::UARTDevice {
  public:
   void setup() override;

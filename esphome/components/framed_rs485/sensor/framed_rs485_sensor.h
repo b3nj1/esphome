@@ -4,7 +4,6 @@
 #include "../framed_rs485.h"
 
 #include <functional>
-#include <string>
 #include <vector>
 
 namespace esphome::framed_rs485 {
