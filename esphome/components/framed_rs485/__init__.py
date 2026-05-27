@@ -24,7 +24,9 @@ framed_rs485_ns = cg.esphome_ns.namespace("framed_rs485")
 FramedRS485Hub = framed_rs485_ns.class_("FramedRS485Hub", cg.Component, uart.UARTDevice)
 FramedRS485FrameTrigger = framed_rs485_ns.class_(
     "FramedRS485FrameTrigger",
-    automation.Trigger.template(cg.std_vector.template(cg.uint8)),
+    automation.Trigger.template(
+        cg.std_vector.template(cg.uint8).operator("const").operator("ref")
+    ),
 )
 
 SensorDecode = framed_rs485_ns.enum("SensorDecode")
@@ -54,10 +56,7 @@ CONF_QUEUE_POLICY = "queue_policy"
 CONF_RX_ACCEPT = "rx_accept"
 CONF_SNIFFER_ONLY = "sniffer_only"
 CONF_STX = "stx"
-CONF_MATCH_ON = "match_on"
-CONF_MATCH_OFF = "match_off"
 CONF_ON_FRAME = "on_frame"
-CONF_TEXT_LAMBDA = "text_lambda"
 CONF_IDLE_COMMAND = "idle_command"
 CONF_TX = "tx"
 CONF_TX_VARIANT = "tx_variant"
@@ -69,7 +68,7 @@ PROFILE_JANDY_RS = "jandy_aqualink_rs"
 PROFILE_GENERIC = "generic_framed_rs485"
 
 KEY_FORMATS = {
-    "wireless_9byte": KeyFormat.KEY_FORMAT_WIRELESS_9BYTE,
+    "wireless_12byte": KeyFormat.KEY_FORMAT_WIRELESS_12BYTE,
     "wired_remote": KeyFormat.KEY_FORMAT_WIRED_REMOTE,
     "wired_local": KeyFormat.KEY_FORMAT_WIRED_LOCAL,
     "jandy_allbutton": KeyFormat.KEY_FORMAT_JANDY_ALLBUTTON,
@@ -99,13 +98,8 @@ TX_GATE_MODES = {
     "fixed_delay": TxGateMode.TX_GATE_FIXED_DELAY,
 }
 
+# Diagnostic-only sensor decode types. User payload decoding is handled by on_frame:.
 SENSOR_DECODES = {
-    "uint8": SensorDecode.SENSOR_DECODE_UINT8,
-    "uint16_be": SensorDecode.SENSOR_DECODE_UINT16_BE,
-    "uint16_le": SensorDecode.SENSOR_DECODE_UINT16_LE,
-    "uint32_be": SensorDecode.SENSOR_DECODE_UINT32_BE,
-    "uint32_le": SensorDecode.SENSOR_DECODE_UINT32_LE,
-    "bcd": SensorDecode.SENSOR_DECODE_BCD,
     "frames_received": SensorDecode.SENSOR_DECODE_FRAMES_RECEIVED,
     "crc_failures": SensorDecode.SENSOR_DECODE_CRC_FAILURES,
     "commands_sent": SensorDecode.SENSOR_DECODE_COMMANDS_SENT,
@@ -125,8 +119,16 @@ def validate_u32(value):
     return HexInt(int(value))
 
 
+# Schema cap matches MAX_FRAME_TYPE_LEN in framed_rs485.h (StaticVector<uint8_t, 8>);
+# the StaticVector::assign() truncates silently past N=8, so the schema must enforce the cap.
 def validate_frame_type(value):
-    return cv.ensure_list(validate_byte)(value)
+    return cv.All(cv.ensure_list(validate_byte), cv.Length(max=8))(value)
+
+
+# Internal dict key used by _profile_defaults to carry a profile-specific TX gate frame
+# default into validate_hub. Not a YAML option (the leading underscore signals "private"),
+# and intentionally not named CONF_* because it never appears in a user-facing schema.
+_PROFILE_GATE_FRAME_TYPE = "_gate_frame_type"
 
 
 def _profile_defaults(profile):
@@ -146,9 +148,12 @@ def _profile_defaults(profile):
             CONF_TX_VARIANT: "header_inclusive",
             CONF_TYPE: "sum8",
             CONF_RX_ACCEPT: ["header_inclusive"],
+            # AllButton address 0x08 + CMD_PROBE 0x00. Jandy AllButton devices live at
+            # 0x08..0x0B; a user with a different address must override this explicitly.
+            _PROFILE_GATE_FRAME_TYPE: [0x08, 0x00],
         }
     return {
-        CONF_KEY_FORMAT: "wireless_9byte",
+        CONF_KEY_FORMAT: "wireless_12byte",
         CONF_TX_VARIANT: "header_inclusive",
     }
 
@@ -181,10 +186,10 @@ TX_GATE_SCHEMA = cv.Schema(
         cv.Optional(CONF_MODE, default="frame_trigger"): cv.one_of(
             *TX_GATE_MODES, lower=True
         ),
-        # Schema caps gate.frame_type at 8 bytes to match the fixed dump_config buffer.
-        cv.Optional(CONF_FRAME_TYPE, default=[0x01, 0x01]): cv.All(
-            validate_frame_type, cv.Length(max=8)
-        ),
+        # No schema-level default for frame_type — _profile_defaults() supplies a
+        # profile-appropriate value (Hayward keep-alive [0x01,0x01], Jandy probe
+        # [0x08,0x00], etc.) in validate_hub. Required for frame_trigger mode.
+        cv.Optional(CONF_FRAME_TYPE): validate_frame_type,
         # delay=0 is valid (no delay after the gate frame before transmitting).
         cv.Optional(CONF_DELAY, default="0ms"): cv.positive_time_period_milliseconds,
         cv.Optional(
@@ -196,13 +201,23 @@ TX_GATE_SCHEMA = cv.Schema(
     }
 )
 
+# Upper bound for max_frame_length: protects against pathological YAML that would reserve
+# ~4 KB scratch buffers per hub. ESPHome's largest framed protocols (Jandy iAqualinkTouch)
+# stay well under 512 bytes; 1024 leaves ample headroom.
+MAX_FRAME_LENGTH_UPPER = 1024
+# Upper bound for max_queue_size with FIFO. Replace_latest is independently constrained to 1.
+MAX_QUEUE_SIZE_UPPER = 32
+
 TX_SCHEMA = cv.Schema(
     {
         cv.Optional(CONF_GATE, default={}): TX_GATE_SCHEMA,
         cv.Optional(CONF_QUEUE_POLICY, default="replace_latest"): cv.one_of(
             *QUEUE_POLICIES, lower=True
         ),
-        cv.Optional(CONF_MAX_QUEUE_SIZE, default=1): cv.positive_int,
+        # cv.positive_int allows 0, which would cause modulo-by-zero in the ring buffer.
+        cv.Optional(CONF_MAX_QUEUE_SIZE, default=1): cv.int_range(
+            min=1, max=MAX_QUEUE_SIZE_UPPER
+        ),
         cv.Optional(CONF_IDLE_COMMAND): validate_u32,
     }
 )
@@ -222,11 +237,44 @@ def validate_hub(config):
     if CONF_RX_ACCEPT in defaults and CONF_RX_ACCEPT not in config[CONF_CRC]:
         config[CONF_CRC][CONF_RX_ACCEPT] = defaults[CONF_RX_ACCEPT]
 
+    # gate.frame_type default is profile-dependent. _profile_defaults supplies a default
+    # for Jandy (the probe frame); other profiles fall back to the Hayward keepalive.
+    gate = config[CONF_TX][CONF_GATE]
+    if CONF_FRAME_TYPE not in gate:
+        gate[CONF_FRAME_TYPE] = defaults.get(_PROFILE_GATE_FRAME_TYPE, [0x01, 0x01])
+
+    sniffer_only = config[CONF_SNIFFER_ONLY]
+    gate_mode = gate[CONF_MODE]
+
+    # When in frame_trigger gate mode (non-sniffer), the gate frame type must not be
+    # empty — otherwise the gate would never fire and queued commands would accumulate
+    # forever. Setup-time runtime warning is too late; reject at config time.
+    if gate_mode == "frame_trigger" and not gate[CONF_FRAME_TYPE] and not sniffer_only:
+        raise cv.Invalid(
+            "tx.gate.frame_type must be a non-empty byte list when tx.gate.mode is "
+            "frame_trigger; the gate would never fire and queued commands would not transmit"
+        )
+
     if (
         config[CONF_TX][CONF_QUEUE_POLICY] == "replace_latest"
         and config[CONF_TX][CONF_MAX_QUEUE_SIZE] != 1
     ):
         raise cv.Invalid("replace_latest requires max_queue_size: 1")
+
+    # Jandy AllButton emulation only works if the AllButton device ACKs every probe.
+    # Without idle_command the device would only respond when a real button is queued,
+    # and the master would mark the AllButton offline between presses.
+    if (
+        profile == PROFILE_JANDY_RS
+        and not sniffer_only
+        and CONF_IDLE_COMMAND not in config[CONF_TX]
+    ):
+        raise cv.Invalid(
+            "jandy_aqualink_rs profile requires tx.idle_command (typically 0x00) unless "
+            "sniffer_only is true; the AllButton emulator must ACK every probe or the "
+            "master will mark it offline"
+        )
+
     return config
 
 
@@ -248,7 +296,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_KEY_FORMAT): cv.one_of(*KEY_FORMATS, lower=True),
             cv.Optional(CONF_DUMP_FRAMES, default=False): cv.boolean,
             cv.Optional(CONF_SNIFFER_ONLY, default=False): cv.boolean,
-            cv.Optional(CONF_MAX_FRAME_LENGTH, default=128): cv.positive_int,
+            # Minimum legal RX frame = DLE STX FT0 FT1 DLE ETX = 6 bytes (no CRC).
+            cv.Optional(CONF_MAX_FRAME_LENGTH, default=128): cv.int_range(
+                min=6, max=MAX_FRAME_LENGTH_UPPER
+            ),
             cv.Optional(
                 CONF_FRAME_TIMEOUT, default="50ms"
             ): cv.positive_time_period_milliseconds,
@@ -285,8 +336,9 @@ def _final_validate(config):
             CONF_STOP_BITS: 1,
         }
         for key, expected in required.items():
-            # UART schema always provides validated defaults, so direct access is safe.
-            if uart_config[key] != expected:
+            # UART schema provides validated defaults for all four keys (baud_rate is
+            # required; the rest default in UART_DEVICE_SCHEMA).
+            if uart_config.get(key) != expected:
                 raise cv.Invalid(
                     f"Framed RS-485 jandy_aqualink_rs profile requires uart {key}: {expected}; "
                     f"use profile: {PROFILE_GENERIC} for other serial settings"
@@ -300,7 +352,7 @@ def _final_validate(config):
         CONF_STOP_BITS: 2,
     }
     for key, expected in required.items():
-        if uart_config[key] != expected:
+        if uart_config.get(key) != expected:
             raise cv.Invalid(
                 f"Framed RS-485 Hayward profiles require uart {key}: {expected}; "
                 f"use profile: {PROFILE_GENERIC} for other serial settings"
@@ -309,12 +361,6 @@ def _final_validate(config):
 
 
 FINAL_VALIDATE_SCHEMA = _final_validate
-
-
-async def setup_listener(var, config):
-    cg.add(var.set_frame_type(config[CONF_FRAME_TYPE]))
-    hub = await cg.get_variable(config[CONF_FRAMED_RS485_ID])
-    cg.add(hub.register_listener(var))
 
 
 async def to_code(config):
@@ -359,7 +405,7 @@ async def to_code(config):
     for conf in config.get(CONF_ON_FRAME, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
         cg.add(trigger.set_frame_type(conf[CONF_FRAME_TYPE]))
-        cg.add(var.register_listener(trigger))
+        cg.add(var.register_trigger(trigger))
         await automation.build_automation(
             trigger,
             [

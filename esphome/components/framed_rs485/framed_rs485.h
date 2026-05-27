@@ -6,6 +6,7 @@
 #include "esphome/core/log.h"
 #include "esphome/components/uart/uart.h"
 
+#include <memory>
 #include <vector>
 
 namespace esphome::framed_rs485 {
@@ -17,25 +18,25 @@ static constexpr size_t MAX_FRAME_TYPE_LEN = 8;
 // Framing overhead added to every TX frame: DLE+STX(2) + DLE+ETX(2) + escaped CRC max(4).
 static constexpr size_t FRAME_OVERHEAD_BYTES = 8;
 
-/// Built-in decode modes for the sensor platform.
+// Maximum payload bytes built by build_key_payload_(). The current widest case is the
+// 12-byte Hayward wireless format (3-byte header + 4-byte key × 2 + 1 pad). A small
+// constant buys room for future key formats without re-tuning the buffer reserve.
+static constexpr size_t MAX_KEY_PAYLOAD_LEN = 16;
+
+/// Diagnostic value exposed by the framed_rs485 sensor/text_sensor platforms.
+/// These are hub state, not user payload decoding — user decoding is done via on_frame:.
 enum SensorDecode {
-  SENSOR_DECODE_UINT8,              ///< Unsigned byte at the configured offset.
-  SENSOR_DECODE_UINT16_BE,          ///< Unsigned 16-bit big-endian at the configured offset.
-  SENSOR_DECODE_UINT16_LE,          ///< Unsigned 16-bit little-endian at the configured offset.
-  SENSOR_DECODE_UINT32_BE,          ///< Unsigned 32-bit big-endian at the configured offset.
-  SENSOR_DECODE_UINT32_LE,          ///< Unsigned 32-bit little-endian at the configured offset.
-  SENSOR_DECODE_BCD,                ///< Packed BCD byte at the configured offset.
-  SENSOR_DECODE_FRAMES_RECEIVED,    ///< Diagnostic: running count of validated RX frames.
-  SENSOR_DECODE_CRC_FAILURES,       ///< Diagnostic: running count of CRC-failed frames.
-  SENSOR_DECODE_COMMANDS_SENT,      ///< Diagnostic: running count of transmitted frames.
-  SENSOR_DECODE_COMMAND_DROPS,      ///< Diagnostic: commands dropped (queue full or sniffer mode).
-  SENSOR_DECODE_LAST_KEEPALIVE_MS,  ///< Diagnostic: interval (ms) between the last two gate frames.
-  SENSOR_DECODE_QUEUE_DEPTH,        ///< Diagnostic: current TX queue depth.
+  SENSOR_DECODE_FRAMES_RECEIVED,    ///< Running count of validated RX frames.
+  SENSOR_DECODE_CRC_FAILURES,       ///< Running count of frames that failed validation (CRC or structural).
+  SENSOR_DECODE_COMMANDS_SENT,      ///< Running count of transmitted user commands.
+  SENSOR_DECODE_COMMAND_DROPS,      ///< Commands dropped (queue full or sniffer mode).
+  SENSOR_DECODE_LAST_KEEPALIVE_MS,  ///< Interval (ms) between the last two gate frames.
+  SENSOR_DECODE_QUEUE_DEPTH,        ///< Current TX queue depth.
 };
 
 /// Key-frame format used when encoding button commands for TX.
 enum KeyFormat {
-  KEY_FORMAT_WIRELESS_9BYTE,   ///< Hayward AquaLogic wireless remote (frame type 0x0083, 9-byte payload).
+  KEY_FORMAT_WIRELESS_12BYTE,  ///< Hayward AquaLogic wireless remote (frame type 0x0083, 12-byte payload).
   KEY_FORMAT_WIRED_REMOTE,     ///< Hayward AquaLogic wired remote.
   KEY_FORMAT_WIRED_LOCAL,      ///< Hayward AquaLogic local wired controller.
   KEY_FORMAT_JANDY_ALLBUTTON,  ///< Jandy AquaLink RS AllButton frame.
@@ -71,39 +72,31 @@ enum TxGateMode {
 
 class FramedRS485Hub;
 
-class FramedRS485Listener {
+/// Automation trigger fired by the hub when a frame matching the configured frame_type
+/// is received. The full decoded payload is passed as the automation argument `payload`:
+/// bytes 0–1 are the two-byte frame type, bytes 2+ are the frame data.
+///
+/// The trigger holds its own frame_type prefix (StaticVector to avoid heap allocation)
+/// and is registered with the hub via register_trigger().
+///
+/// Note: build_callback_automation() (preferred by CLAUDE.md for stateless triggers)
+/// cannot be used because the trigger must carry its own frame_type filter for the hub
+/// to dispatch against. A full Trigger subclass is justified.
+class FramedRS485FrameTrigger : public Trigger<const std::vector<uint8_t> &> {
  public:
   void set_frame_type(const std::vector<uint8_t> &frame_type) {
     this->frame_type_.assign(frame_type.begin(), frame_type.end());
   }
   bool matches(const std::vector<uint8_t> &payload) const;
-  virtual void handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) = 0;
 
  protected:
-  // Fixed-size storage: no heap allocation per listener. MAX_FRAME_TYPE_LEN matches the
-  // Python schema cv.Length(max=8) cap on frame_type lists.
   StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> frame_type_;
 };
 
-/// Automation trigger that fires when a framed RS-485 frame matching the configured
-/// frame_type is received. The full decoded payload is passed as the automation argument
-/// `payload`: bytes 0-1 are the two-byte frame type, bytes 2+ are the frame data.
-///
-/// Registered with the hub via register_listener() — it is itself a listener.
-///
-/// Note: build_callback_automation() (preferred by CLAUDE.md for stateless triggers) cannot
-/// be used here because the trigger must also implement FramedRS485Listener (which requires
-/// frame_type_ storage and a virtual handle_frame()). The full Trigger subclass is justified.
-class FramedRS485FrameTrigger : public Trigger<std::vector<uint8_t>>, public FramedRS485Listener {
- public:
-  void handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) override {
-    this->trigger(payload);
-  }
-};
-
 /// Central hub for a DLE-framed RS-485 bus. Owns the UART framer, TX queue,
-/// CRC engine, and listener registry. Subcomponents (sensors, buttons, etc.)
-/// register themselves via register_listener() and receive decoded frame payloads.
+/// CRC engine, and the on_frame: trigger registry. User payload decoding is done
+/// via on_frame: triggers and globals/template sensors — this class no longer
+/// dispatches to per-platform listener subclasses.
 class FramedRS485Hub : public Component, public uart::UARTDevice {
  public:
   void setup() override;
@@ -137,7 +130,7 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
 
   bool queue_command_value(uint32_t command);
   bool queue_raw_frame(const std::vector<uint8_t> &payload);
-  void register_listener(FramedRS485Listener *listener) { this->listeners_.push_back(listener); }
+  void register_trigger(FramedRS485FrameTrigger *trigger) { this->triggers_.push_back(trigger); }
 
   uint32_t get_frames_received() const { return this->frames_received_; }
   uint32_t get_crc_failures() const { return this->crc_failures_; }
@@ -165,6 +158,7 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   void update_last_frame_type_();
   size_t queue_size_() const { return this->tx_queue_count_; }
   void queue_pop_front_();
+  void write_frame_(const std::vector<uint8_t> &frame);
 
   uint8_t dle_{0x10};
   uint8_t stx_{0x02};
@@ -181,7 +175,7 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   uint32_t tx_fixed_interval_{100};
   QueuePolicy queue_policy_{QUEUE_REPLACE_LATEST};
   uint32_t max_queue_size_{1};
-  KeyFormat key_format_{KEY_FORMAT_WIRELESS_9BYTE};
+  KeyFormat key_format_{KEY_FORMAT_WIRELESS_12BYTE};
   uint32_t idle_command_{0};
   bool has_idle_command_{false};
   bool dump_frames_{false};
@@ -189,10 +183,11 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   uint32_t max_frame_length_{128};
   uint32_t in_frame_timeout_ms_{50};
 
-  std::vector<FramedRS485Listener *> listeners_;
+  std::vector<FramedRS485FrameTrigger *> triggers_;
   // Ring buffer: pre-sized and pre-reserved in setup() to avoid per-frame heap allocation.
-  // Slots are swapped with tx_frame_buf_ on enqueue (no copy). MAX size is max_frame_length_
-  // * 2 + FRAME_OVERHEAD_BYTES (worst case: all payload bytes are DLE and must be escaped).
+  // Slots are swapped with tx_frame_buf_ on enqueue (no copy). Max slot size is
+  // max_frame_length_ * 2 + FRAME_OVERHEAD_BYTES (worst case: all payload bytes are DLE and
+  // must be escaped).
   std::vector<std::vector<uint8_t>> tx_queue_;
   size_t tx_queue_head_{0};   // index of the next slot to read
   size_t tx_queue_tail_{0};   // index of the next slot to write
@@ -218,11 +213,20 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   std::vector<uint8_t> tx_escaped_buf_;
   std::vector<uint8_t> tx_frame_buf_;
 
+  // Setup-time allocated hex-text buffer for dump_frames logging. Sized to fit the
+  // worst-case TX frame (max_frame_length_ * 2 + FRAME_OVERHEAD_BYTES bytes fully
+  // escaped, 2 hex chars per byte + null). Allocated once in setup() so the log path
+  // never touches the heap after that.
+  std::unique_ptr<char[]> hex_log_buf_;
+  size_t hex_log_buf_size_{0};
+
   uint32_t frames_received_{0};
   uint32_t crc_failures_{0};
   uint32_t commands_sent_{0};
   uint32_t command_drops_{0};
-  // Fixed buffer: 4 hex chars for a 2-byte frame type + null terminator.
+  // Fixed buffer: 4 hex chars for a 2-byte frame type prefix + null terminator. Built-in
+  // last_frame_type diagnostic publishes the first two bytes of the payload as hex; longer
+  // frame_type prefixes still match correctly but the diagnostic only shows the first two.
   char last_frame_type_[5]{};
 };
 

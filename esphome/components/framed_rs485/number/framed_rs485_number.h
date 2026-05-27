@@ -12,7 +12,7 @@ class FramedRS485Number : public number::Number {
  public:
   using encode_lambda_t = std::function<optional<std::vector<uint8_t>>(float)>;
   explicit FramedRS485Number(FramedRS485Hub *parent) : parent_(parent) {}
-  void set_template(encode_lambda_t lambda) { this->lambda_ = lambda; }
+  void set_template(encode_lambda_t &&lambda) { this->lambda_ = std::move(lambda); }
 
  protected:
   void control(float value) override;

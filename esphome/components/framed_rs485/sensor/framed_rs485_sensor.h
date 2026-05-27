@@ -1,26 +1,53 @@
 #pragma once
 
 #include "esphome/components/sensor/sensor.h"
+#include "esphome/core/component.h"
 #include "../framed_rs485.h"
-
-#include <functional>
-#include <vector>
 
 namespace esphome::framed_rs485 {
 
-class FramedRS485Sensor : public sensor::Sensor, public FramedRS485Listener {
+/// Diagnostic sensor that publishes a hub state value (frames received, CRC failures,
+/// queue depth, etc.) on change only. User payload decoding is done via on_frame: +
+/// globals: + template sensors; this platform is only for hub diagnostics.
+///
+/// sensor::Sensor::publish_state() deduplicates equal-valued publishes internally, so
+/// a counter that has not advanced does not generate API traffic.
+class FramedRS485Sensor : public sensor::Sensor, public Component {
  public:
-  using decode_lambda_t = std::function<optional<float>(const std::vector<uint8_t> &)>;
+  void set_parent(FramedRS485Hub *parent) { this->parent_ = parent; }
   void set_decode(SensorDecode decode) { this->decode_ = decode; }
-  void set_offset(uint32_t offset) { this->offset_ = offset; }
-  void set_template(decode_lambda_t lambda) { this->lambda_ = lambda; }
-  void handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) override;
+
+  void loop() override {
+    if (this->parent_ == nullptr)
+      return;
+    float value = 0.0f;
+    switch (this->decode_) {
+      case SENSOR_DECODE_FRAMES_RECEIVED:
+        value = static_cast<float>(this->parent_->get_frames_received());
+        break;
+      case SENSOR_DECODE_CRC_FAILURES:
+        value = static_cast<float>(this->parent_->get_crc_failures());
+        break;
+      case SENSOR_DECODE_COMMANDS_SENT:
+        value = static_cast<float>(this->parent_->get_commands_sent());
+        break;
+      case SENSOR_DECODE_COMMAND_DROPS:
+        value = static_cast<float>(this->parent_->get_command_drops());
+        break;
+      case SENSOR_DECODE_LAST_KEEPALIVE_MS:
+        value = static_cast<float>(this->parent_->get_last_keepalive_ms());
+        break;
+      case SENSOR_DECODE_QUEUE_DEPTH:
+        value = static_cast<float>(this->parent_->get_queue_depth());
+        break;
+    }
+    this->publish_state(value);
+  }
+  float get_setup_priority() const override { return setup_priority::DATA; }
 
  protected:
-  optional<float> decode_builtin_(FramedRS485Hub *hub, const std::vector<uint8_t> &payload) const;
-  SensorDecode decode_{SENSOR_DECODE_UINT8};
-  decode_lambda_t lambda_{nullptr};
-  uint32_t offset_{0};
+  FramedRS485Hub *parent_{nullptr};
+  SensorDecode decode_{SENSOR_DECODE_FRAMES_RECEIVED};
 };
 
 }  // namespace esphome::framed_rs485

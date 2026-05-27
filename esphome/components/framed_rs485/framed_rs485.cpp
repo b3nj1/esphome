@@ -2,26 +2,15 @@
 
 #include "esphome/core/application.h"
 
-#ifdef USE_BINARY_SENSOR
-#include "binary_sensor/framed_rs485_binary_sensor.h"
-#endif
 #ifdef USE_BUTTON
 #include "button/framed_rs485_button.h"
 #endif
 #ifdef USE_NUMBER
 #include "number/framed_rs485_number.h"
 #endif
-#ifdef USE_SENSOR
-#include "sensor/framed_rs485_sensor.h"
-#endif
-#ifdef USE_TEXT_SENSOR
-#include "text_sensor/framed_rs485_text_sensor.h"
-#endif
 
 #include <algorithm>
-#include <cctype>
-#include <cmath>
-#include <cstdlib>
+#include <cinttypes>
 
 namespace esphome::framed_rs485 {
 
@@ -68,7 +57,7 @@ static const char *queue_policy_str(QueuePolicy p) {
   }
 }
 
-bool FramedRS485Listener::matches(const std::vector<uint8_t> &payload) const {
+bool FramedRS485FrameTrigger::matches(const std::vector<uint8_t> &payload) const {
   if (this->frame_type_.empty())
     return true;
   if (payload.size() < this->frame_type_.size())
@@ -77,16 +66,12 @@ bool FramedRS485Listener::matches(const std::vector<uint8_t> &payload) const {
 }
 
 void FramedRS485Hub::setup() {
-  if (this->tx_gate_mode_ == TX_GATE_FRAME_TRIGGER && this->tx_gate_frame_type_.empty() && !this->sniffer_only_) {
-    ESP_LOGW(TAG, "TX gate mode is frame_trigger but gate.frame_type is empty — TX will never fire; "
-                  "use idle_gap or fixed_delay instead");
-  }
   // Pre-allocate scratch buffers to avoid per-frame heap churn on the main receive path.
   const size_t tx_slot_capacity = this->max_frame_length_ * 2 + FRAME_OVERHEAD_BYTES;
   this->raw_frame_.reserve(this->max_frame_length_);
   this->rx_unescaped_.reserve(this->max_frame_length_);
   this->rx_payload_.reserve(this->max_frame_length_);
-  this->tx_payload_buf_.reserve(16);
+  this->tx_payload_buf_.reserve(MAX_KEY_PAYLOAD_LEN);
   // tx_escaped_buf_ worst case: every payload byte is DLE and requires an escape byte.
   this->tx_escaped_buf_.reserve(this->max_frame_length_ * 2);
   this->tx_frame_buf_.reserve(tx_slot_capacity);
@@ -95,6 +80,9 @@ void FramedRS485Hub::setup() {
   this->tx_queue_.resize(this->max_queue_size_);
   for (auto &slot : this->tx_queue_)
     slot.reserve(tx_slot_capacity);
+  // Hex-text log buffer sized to the worst-case TX frame (2 hex chars per byte + NUL).
+  this->hex_log_buf_size_ = tx_slot_capacity * 2 + 1;
+  this->hex_log_buf_ = std::make_unique<char[]>(this->hex_log_buf_size_);
 }
 
 void FramedRS485Hub::loop() {
@@ -108,42 +96,43 @@ void FramedRS485Hub::loop() {
     ESP_LOGW(TAG, "Intra-frame timeout — resetting receive state");
     this->in_frame_ = false;
     this->raw_frame_.clear();
+    // Reset previous_byte_ so a stale DLE before the timeout can't combine with the next STX
+    // to spuriously start a new frame on the first byte received after recovery.
+    this->previous_byte_ = 0;
   }
 
   this->maybe_tx_(now);
   // Unsigned subtraction wraps correctly so this comparison handles the 49-day millis rollover.
   if (this->tx_start_pending_ && now - this->tx_start_at_ < 0x80000000UL) {
     this->tx_start_pending_ = false;
-    this->write_array(this->pending_tx_frame_);
-    this->flush();
-    ESP_LOGD(TAG, "TX %s",
-             format_hex(this->pending_tx_frame_).c_str());  // NOLINT(cppcoreguidelines-pro-type-vararg): debug path,
-                                                            // compiled out in non-debug builds; frame size is variable
+    this->write_frame_(this->pending_tx_frame_);
     this->last_tx_time_ = now;
     if (!this->pending_is_idle_)
       this->commands_sent_++;
+    this->pending_is_idle_ = false;
   }
 }
 
 void FramedRS485Hub::dump_config() {
-  ESP_LOGCONFIG(TAG, "Framed RS-485:");
-  ESP_LOGCONFIG(TAG, "  Framing: DLE=0x%02x STX=0x%02x ETX=0x%02x ESC=0x%02x", this->dle_, this->stx_, this->etx_,
-                this->escape_byte_);
-  ESP_LOGCONFIG(TAG, "  CRC type: %s, accept header CRC: %s, accept payload CRC: %s", crc_type_str(this->crc_type_),
-                YESNO(this->accept_header_crc_), YESNO(this->accept_payload_crc_));
-  // gate_hex buffer holds MAX_FRAME_TYPE_LEN bytes; std::min guards against a direct C++ caller
-  // bypassing the schema's cv.Length(max=MAX_FRAME_TYPE_LEN) constraint.
+  // StaticVector caps the size at MAX_FRAME_TYPE_LEN, so no run-time bound needed.
   char gate_hex[format_hex_size(MAX_FRAME_TYPE_LEN)];
-  format_hex_to(gate_hex, this->tx_gate_frame_type_.data(),
-                std::min(this->tx_gate_frame_type_.size(), MAX_FRAME_TYPE_LEN));
-  ESP_LOGCONFIG(TAG, "  TX gate: %s, gate frame: %s, gate delay: %ums", tx_gate_mode_str(this->tx_gate_mode_), gate_hex,
-                this->tx_gate_delay_);
-  ESP_LOGCONFIG(TAG, "  TX idle gap: %ums, TX interval: %ums", this->tx_idle_gap_, this->tx_fixed_interval_);
-  ESP_LOGCONFIG(TAG, "  Queue policy: %s, queue size: %u", queue_policy_str(this->queue_policy_),
-                this->max_queue_size_);
-  ESP_LOGCONFIG(TAG, "  Max frame length: %u, frame timeout: %ums", this->max_frame_length_,
-                this->in_frame_timeout_ms_);
-  ESP_LOGCONFIG(TAG, "  Sniffer only: %s, dump frames: %s", YESNO(this->sniffer_only_), YESNO(this->dump_frames_));
+  format_hex_to(gate_hex, this->tx_gate_frame_type_.data(), this->tx_gate_frame_type_.size());
+  // Consolidated multi-line ESP_LOGCONFIG (matches modbus_server style) to save flash.
+  ESP_LOGCONFIG(TAG,
+                "Framed RS-485:\n"
+                "  Framing: DLE=0x%02x STX=0x%02x ETX=0x%02x ESC=0x%02x\n"
+                "  CRC type: %s, accept header CRC: %s, accept payload CRC: %s\n"
+                "  TX gate: %s, gate frame: %s, gate delay: %" PRIu32 "ms\n"
+                "  TX idle gap: %" PRIu32 "ms, TX interval: %" PRIu32 "ms\n"
+                "  Queue policy: %s, queue size: %" PRIu32 "\n"
+                "  Max frame length: %" PRIu32 ", frame timeout: %" PRIu32 "ms\n"
+                "  Sniffer only: %s, dump frames: %s",
+                this->dle_, this->stx_, this->etx_, this->escape_byte_, crc_type_str(this->crc_type_),
+                YESNO(this->accept_header_crc_), YESNO(this->accept_payload_crc_),
+                tx_gate_mode_str(this->tx_gate_mode_), gate_hex, this->tx_gate_delay_, this->tx_idle_gap_,
+                this->tx_fixed_interval_, queue_policy_str(this->queue_policy_), this->max_queue_size_,
+                this->max_frame_length_, this->in_frame_timeout_ms_, YESNO(this->sniffer_only_),
+                YESNO(this->dump_frames_));
 }
 
 void FramedRS485Hub::set_framing(uint8_t dle, uint8_t stx, uint8_t etx, uint8_t escape_byte) {
@@ -225,6 +214,11 @@ void FramedRS485Hub::read_uart_(uint32_t now) {
       this->in_frame_ = false;
       this->raw_frame_.clear();
     }
+    // Maintain previous_byte_ for every in-frame byte too. Without this, a normal frame
+    // terminator (DLE ETX) leaves previous_byte_ stale at the value seen just before the
+    // frame began (typically DLE), so a bare STX immediately after the terminator would
+    // spuriously start a new frame.
+    this->previous_byte_ = byte;
   }
 }
 
@@ -237,9 +231,12 @@ void FramedRS485Hub::process_raw_frame_(uint32_t now) {
   this->frames_received_++;
   this->update_last_frame_type_();
   if (this->dump_frames_) {
-    ESP_LOGD(TAG, "RX %s",
-             format_hex(this->rx_payload_).c_str());  // NOLINT(cppcoreguidelines-pro-type-vararg): debug path gated by
-                                                      // dump_frames; payload size is variable
+    // Reuse the setup-time allocated hex_log_buf_ to avoid per-frame heap allocation
+    // that the std::vector-returning hex formatter would incur. Buffer is sized for the
+    // worst-case TX frame so any RX payload fits.
+    format_hex_to(this->hex_log_buf_.get(), this->hex_log_buf_size_, this->rx_payload_.data(),
+                  this->rx_payload_.size());
+    ESP_LOGD(TAG, "RX %s", this->hex_log_buf_.get());
   }
 
   if (this->frame_type_equals_(this->rx_payload_, this->tx_gate_frame_type_)) {
@@ -251,9 +248,9 @@ void FramedRS485Hub::process_raw_frame_(uint32_t now) {
       this->send_next_(now);
   }
 
-  for (auto *listener : this->listeners_) {
-    if (listener->matches(this->rx_payload_))
-      listener->handle_frame(this, this->rx_payload_, now);
+  for (auto *trigger : this->triggers_) {
+    if (trigger->matches(this->rx_payload_))
+      trigger->trigger(this->rx_payload_);
   }
 }
 
@@ -267,14 +264,24 @@ bool FramedRS485Hub::validate_frame_() {
     return false;
 
   this->rx_unescaped_.clear();
+  // The frame[] iteration covers bytes between the opening STX (index 1) and the closing
+  // DLE+ETX (last 2 bytes). A DLE inside that range must be followed by escape_byte_;
+  // any other DLE successor is a protocol violation and the frame is rejected.
   for (size_t i = 2; i + 2 < frame.size(); i++) {
     uint8_t b = frame[i];
-    if (b == this->dle_ && i + 1 < frame.size() - 2 && frame[i + 1] == this->escape_byte_) {
-      this->rx_unescaped_.push_back(this->dle_);
-      i++;
-    } else {
-      this->rx_unescaped_.push_back(b);
+    if (b == this->dle_) {
+      // i+1 < frame.size()-2 means "DLE has a successor that is not part of the closing
+      // DLE+ETX terminator". A DLE that is the first byte of DLE+ETX is handled by the
+      // framer (loop terminates before reaching it), so reaching here means a DLE is
+      // followed by something that must be the escape byte. Anything else is invalid.
+      if (i + 1 < frame.size() - 2 && frame[i + 1] == this->escape_byte_) {
+        this->rx_unescaped_.push_back(this->dle_);
+        i++;
+        continue;
+      }
+      return false;
     }
+    this->rx_unescaped_.push_back(b);
   }
   size_t crc_len = this->crc_length_();
   if (this->rx_unescaped_.size() < 2 + crc_len)
@@ -405,8 +412,8 @@ void FramedRS485Hub::build_frame_(const std::vector<uint8_t> &payload, std::vect
 
 void FramedRS485Hub::build_key_payload_(uint32_t command, std::vector<uint8_t> &out) const {
   out.clear();
-  if (this->key_format_ == KEY_FORMAT_WIRELESS_9BYTE) {
-    // Hayward wireless remote frame type 0x0083: 3-byte header + 4-byte key × 2 + 1 pad byte.
+  if (this->key_format_ == KEY_FORMAT_WIRELESS_12BYTE) {
+    // Hayward wireless remote frame type 0x0083: 3-byte header + 4-byte key × 2 + 1 pad byte = 12 bytes.
     // Source: https://github.com/swilson/aqualogic (bus captures, wireless remote protocol).
     out.push_back(0x00);
     out.push_back(0x83);  // frame sub-type: wireless keypress
@@ -422,12 +429,19 @@ void FramedRS485Hub::build_key_payload_(uint32_t command, std::vector<uint8_t> &
   }
 
   if (this->key_format_ == KEY_FORMAT_JANDY_ALLBUTTON) {
-    // Jandy AquaLink RS AllButton frame: 3-byte header + 1-byte button code.
-    // Source: Jandy RS-485 protocol documentation.
+    // Jandy AquaLink RS AllButton response. Community-contributed; the third byte (0x80
+    // here) varies between reverse-engineered descriptions and has not been verified on
+    // physical hardware. If your master rejects responses, capture a known-good response
+    // and adjust this builder.
+    //
+    // Protocol envelope reference (DLE STX <data> <checksum> DLE ETX):
+    //   https://wiki.jmehan.com/display/KNOW/Jandy+Pool+Heater
+    // AllButton ACK byte sequence variants (community reverse-engineering):
+    //   https://github.com/earlephilhower/aquaweb/blob/master/protocol.md
     out.push_back(0x00);
-    out.push_back(0x01);  // frame sub-type: AllButton keypress
-    out.push_back(0x80);  // AllButton master address
-    out.push_back(static_cast<uint8_t>(command & 0xFF));
+    out.push_back(0x01);
+    out.push_back(0x80);
+    out.push_back(command & 0xFF);
     return;
   }
 
@@ -443,7 +457,13 @@ void FramedRS485Hub::build_key_payload_(uint32_t command, std::vector<uint8_t> &
 }
 
 void FramedRS485Hub::maybe_tx_(uint32_t now) {
-  if (this->sniffer_only_ || this->queue_size_() == 0 || this->tx_start_pending_)
+  if (this->sniffer_only_ || this->tx_start_pending_)
+    return;
+  // For idle_gap and fixed_delay modes, fire the gate regardless of queue depth so that
+  // idle_command keepalives can be emitted; send_next_() falls through to send_next_idle_()
+  // when the queue is empty and an idle command is configured.
+  const bool queue_or_idle = this->queue_size_() > 0 || this->has_idle_command_;
+  if (!queue_or_idle)
     return;
   if (this->tx_gate_mode_ == TX_GATE_IDLE_GAP && this->last_rx_time_ != 0 &&
       now - this->last_rx_time_ >= this->tx_idle_gap_)
@@ -458,6 +478,24 @@ void FramedRS485Hub::queue_pop_front_() {
   this->tx_queue_[this->tx_queue_head_].clear();
   this->tx_queue_head_ = (this->tx_queue_head_ + 1) % this->max_queue_size_;
   this->tx_queue_count_--;
+}
+
+void FramedRS485Hub::write_frame_(const std::vector<uint8_t> &frame) {
+  this->write_array(frame);
+#ifdef USE_ARDUINO
+  // On Arduino paths the uart component does not drive flow_control_pin, so users must
+  // run on auto-DE transceivers (DE follows the TX line state). flush() prevents the
+  // function from returning before bytes are physically on the wire so the transceiver
+  // does not flip back to RX mid-frame. On ESP-IDF the hardware RS-485 half-duplex mode
+  // drives DE/RE from the shift-register-done signal; flush() there is pure busy-wait
+  // and is omitted to keep loop() responsive.
+  this->flush();
+#endif
+  if (this->dump_frames_) {
+    // Reuse the setup-time allocated hex_log_buf_ — no heap allocation per TX.
+    format_hex_to(this->hex_log_buf_.get(), this->hex_log_buf_size_, frame.data(), frame.size());
+    ESP_LOGD(TAG, "TX %s", this->hex_log_buf_.get());
+  }
 }
 
 void FramedRS485Hub::send_next_(uint32_t now) {
@@ -479,13 +517,7 @@ void FramedRS485Hub::send_next_(uint32_t now) {
     return;
   }
 
-  {
-    const auto &frame = this->tx_queue_[this->tx_queue_head_];
-    this->write_array(frame);
-    this->flush();
-    ESP_LOGD(TAG, "TX %s", format_hex(frame).c_str());  // NOLINT(cppcoreguidelines-pro-type-vararg): debug path,
-                                                        // compiled out in non-debug builds; frame size is variable
-  }
+  this->write_frame_(this->tx_queue_[this->tx_queue_head_]);
   this->queue_pop_front_();
   this->last_tx_time_ = now;
   this->commands_sent_++;
@@ -501,13 +533,9 @@ void FramedRS485Hub::send_next_idle_(uint32_t now) {
     this->pending_is_idle_ = true;
     return;
   }
-  this->write_array(this->tx_frame_buf_);
-  this->flush();
+  this->write_frame_(this->tx_frame_buf_);
   this->last_tx_time_ = now;
   // Idle keepalives are not counted in commands_sent_ — that counter tracks only real HA commands.
-  ESP_LOGD(TAG, "TX idle %s",
-           format_hex(this->tx_frame_buf_).c_str());  // NOLINT(cppcoreguidelines-pro-type-vararg): debug path, compiled
-                                                      // out in non-debug builds; frame size is variable
 }
 
 bool FramedRS485Hub::queue_raw_frame(const std::vector<uint8_t> &payload) {
@@ -535,179 +563,6 @@ void FramedRS485Hub::update_last_frame_type_() {
 #ifdef USE_BUTTON
 void FramedRS485Button::press_action() { this->parent_->queue_command_value(this->command_value_); }
 #endif  // USE_BUTTON
-
-#ifdef USE_BINARY_SENSOR
-/// Collapses whitespace runs to a single space and trims both ends, in-place.
-/// Two-pointer approach: writes back into the same buffer, no heap allocation.
-static void normalize_display_ws(std::string &s) {
-  size_t write = 0;
-  bool in_space = true;  // start true so leading whitespace is dropped without special-casing
-  for (size_t i = 0; i < s.size(); i++) {
-    char c = s[i];
-    if (std::isspace(static_cast<unsigned char>(c))) {
-      if (!in_space) {
-        s[write++] = ' ';
-        in_space = true;
-      }
-    } else {
-      s[write++] = c;
-      in_space = false;
-    }
-  }
-  // Drop any trailing space written just before the final whitespace run.
-  if (write > 0 && s[write - 1] == ' ')
-    write--;
-  s.resize(write);
-}
-
-void FramedRS485BinarySensor::add_match_on(const std::string &s) {
-  // Normalize at setup time so the hot path never allocates a second string.
-  std::string normalized = s;
-  normalize_display_ws(normalized);
-  this->match_on_.push_back(std::move(normalized));
-}
-void FramedRS485BinarySensor::add_match_off(const std::string &s) {
-  std::string normalized = s;
-  normalize_display_ws(normalized);
-  this->match_off_.push_back(std::move(normalized));
-}
-
-// Returns true if all needles appear (case-insensitive substring) in haystack.
-// Needles are expected to be pre-normalized (no extra whitespace).
-static bool all_match(const std::string &haystack, const std::vector<std::string> &needles) {
-  for (const auto &needle : needles) {
-    auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
-                          [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
-    if (it == haystack.end())
-      return false;
-  }
-  return true;
-}
-
-void FramedRS485BinarySensor::handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) {
-  // Mode 1: fully custom stateless decode.
-  if (this->lambda_ != nullptr) {
-    auto value = this->lambda_(payload);
-    if (value.has_value())
-      this->publish_state(value.value());
-    return;
-  }
-
-  // Mode 2: latching text match.
-  // Extract a string from the payload, then apply match_on/match_off/timeout latch logic.
-  std::string text;
-  if (this->text_lambda_ != nullptr) {
-    auto result = this->text_lambda_(payload);
-    if (!result.has_value())
-      return;  // text_lambda signalled "skip this frame"
-    text = std::move(result.value());
-  } else {
-    // Default: printable ASCII bytes from the full payload.
-    // Reserve payload.size() so push_back never reallocates regardless of payload length.
-    text.reserve(payload.size());
-    for (auto b : payload) {
-      if (b >= 0x20 && b < 0x7F)
-        text.push_back(static_cast<char>(b));
-    }
-  }
-  normalize_display_ws(text);
-
-  // Proof positive: all match_on strings present — latch true.
-  if (!this->match_on_.empty() && all_match(text, this->match_on_)) {
-    this->last_proof_ms_ = now;
-    this->timed_out_ = false;
-    this->publish_state(true);
-    return;
-  }
-
-  // Proof negative: all match_off strings present — latch false.
-  if (!this->match_off_.empty() && all_match(text, this->match_off_)) {
-    this->last_proof_ms_ = now;
-    this->timed_out_ = false;
-    this->publish_state(false);
-    return;
-  }
-
-  // Neither proof seen — check timeout.
-  // last_proof_ms_ == 0 means no proof yet; do not expire before the first known state.
-  if (this->timeout_ms_ > 0 && this->last_proof_ms_ != 0 && !this->timed_out_) {
-    if (now - this->last_proof_ms_ >= this->timeout_ms_) {
-      this->timed_out_ = true;
-      this->publish_state(false);
-    }
-  }
-}
-#endif  // USE_BINARY_SENSOR
-
-#ifdef USE_SENSOR
-optional<float> FramedRS485Sensor::decode_builtin_(FramedRS485Hub *hub, const std::vector<uint8_t> &payload) const {
-  switch (this->decode_) {
-    case SENSOR_DECODE_UINT8:
-      if (payload.size() <= this->offset_)
-        return {};
-      return static_cast<float>(payload[this->offset_]);
-    case SENSOR_DECODE_UINT16_BE:
-      if (payload.size() <= this->offset_ + 1)
-        return {};
-      return static_cast<float>((static_cast<uint16_t>(payload[this->offset_]) << 8) | payload[this->offset_ + 1]);
-    case SENSOR_DECODE_UINT16_LE:
-      if (payload.size() <= this->offset_ + 1)
-        return {};
-      return static_cast<float>(payload[this->offset_] | (static_cast<uint16_t>(payload[this->offset_ + 1]) << 8));
-    case SENSOR_DECODE_UINT32_BE:
-      if (payload.size() <= this->offset_ + 3)
-        return {};
-      return static_cast<float>((static_cast<uint32_t>(payload[this->offset_]) << 24) |
-                                (static_cast<uint32_t>(payload[this->offset_ + 1]) << 16) |
-                                (static_cast<uint32_t>(payload[this->offset_ + 2]) << 8) |
-                                static_cast<uint32_t>(payload[this->offset_ + 3]));
-    case SENSOR_DECODE_UINT32_LE:
-      if (payload.size() <= this->offset_ + 3)
-        return {};
-      return static_cast<float>(static_cast<uint32_t>(payload[this->offset_]) |
-                                (static_cast<uint32_t>(payload[this->offset_ + 1]) << 8) |
-                                (static_cast<uint32_t>(payload[this->offset_ + 2]) << 16) |
-                                (static_cast<uint32_t>(payload[this->offset_ + 3]) << 24));
-    case SENSOR_DECODE_BCD:
-      if (payload.size() <= this->offset_)
-        return {};
-      return static_cast<float>(((payload[this->offset_] & 0xF0) >> 4) * 10 + (payload[this->offset_] & 0x0F));
-    case SENSOR_DECODE_FRAMES_RECEIVED:
-      return static_cast<float>(hub->get_frames_received());
-    case SENSOR_DECODE_CRC_FAILURES:
-      return static_cast<float>(hub->get_crc_failures());
-    case SENSOR_DECODE_COMMANDS_SENT:
-      return static_cast<float>(hub->get_commands_sent());
-    case SENSOR_DECODE_COMMAND_DROPS:
-      return static_cast<float>(hub->get_command_drops());
-    case SENSOR_DECODE_LAST_KEEPALIVE_MS:
-      return static_cast<float>(hub->get_last_keepalive_ms());
-    case SENSOR_DECODE_QUEUE_DEPTH:
-      return static_cast<float>(hub->get_queue_depth());
-  }
-  return {};
-}
-
-void FramedRS485Sensor::handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) {
-  optional<float> value = this->lambda_ != nullptr ? this->lambda_(payload) : this->decode_builtin_(hub, payload);
-  if (value.has_value())
-    this->publish_state(value.value());
-}
-#endif  // USE_SENSOR
-
-#ifdef USE_TEXT_SENSOR
-void FramedRS485TextSensor::handle_frame(FramedRS485Hub *hub, const std::vector<uint8_t> &payload, uint32_t now) {
-  optional<std::string> value;
-  if (this->lambda_ != nullptr) {
-    value = this->lambda_(payload);
-  } else {
-    // Only built-in mode: last_frame_type.
-    value = std::string(hub->get_last_frame_type());
-  }
-  if (value.has_value())
-    this->publish_state(value.value());
-}
-#endif  // USE_TEXT_SENSOR
 
 #ifdef USE_NUMBER
 void FramedRS485Number::control(float value) {

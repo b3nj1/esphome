@@ -1,5 +1,7 @@
-## Config-only validation tests for profile UART enforcement.
-## These are intentionally NOT compiled — they test schema validation paths only.
+## Config-only validation tests for profile UART enforcement and gate-frame defaults.
+## These exercise validate_hub() + _final_validate() branches that the regular
+## test.*.yaml configs (which use generic_framed_rs485) do not reach. CI runs this with
+## `esphome config` only; it is never compiled.
 
 uart:
   # Hayward profiles require 19200 8N2
@@ -20,30 +22,49 @@ uart:
     parity: NONE
     stop_bits: 1
 
+  # Generic UART with deliberately atypical settings — proves generic_framed_rs485
+  # skips final_validate UART enforcement entirely.
+  - id: generic_uart
+    tx_pin: GPIO21
+    rx_pin: GPIO22
+    baud_rate: 38400
+    data_bits: 7
+    parity: EVEN
+    stop_bits: 1
+
 framed_rs485:
-  # Hayward wireless profile — default, no key_format override needed.
+  # Hayward wireless — default key_format wireless_12byte, gate [0x01, 0x01].
   - id: hayward_wireless_hub
     uart_id: hayward_uart
     profile: hayward_aqualogic_wireless
 
-  # Hayward wired remote profile — CRC is payload-only, key format overridden by profile.
+  # Hayward wired remote — payload-only CRC, key_format wired_remote.
   - id: hayward_wired_remote_hub
     uart_id: hayward_uart
     profile: hayward_aqualogic_wired_remote
 
-  # Hayward wired local — same UART as wired remote, different key format.
+  # Hayward wired local — payload-only CRC, key_format wired_local.
   - id: hayward_wired_local_hub
     uart_id: hayward_uart
     profile: hayward_aqualogic_wired_local
 
-  # Jandy AquaLink RS profile.
+  # Jandy AllButton emulator — profile injects gate frame [0x08, 0x00] (AllButton probe)
+  # and sum8 header-inclusive CRC. Requires idle_command (enforced by validate_hub).
   - id: jandy_hub
     uart_id: jandy_uart
     profile: jandy_aqualink_rs
+    tx:
+      idle_command: 0x00
 
-  # Generic profile bypasses UART enforcement and accepts any settings.
+  # Jandy in sniffer mode — exempted from the idle_command requirement.
+  - id: jandy_sniffer_hub
+    uart_id: jandy_uart
+    profile: jandy_aqualink_rs
+    sniffer_only: true
+
+  # Generic profile bypasses final_validate UART enforcement so 38400 7E1 is accepted.
   - id: generic_hub
-    uart_id: jandy_uart   # reuse 9600 UART — generic profile does not validate
+    uart_id: generic_uart
     profile: generic_framed_rs485
     crc:
       type: none

@@ -2,15 +2,20 @@ globals:
   - id: g_led_mask
     type: uint32_t
     initial_value: "0"
+  - id: g_display_text
+    type: std::string
+    initial_value: '""'
 
 framed_rs485:
+  # Hub 1 — exercises on_frame: triggers + diagnostic sensors + button + number.
+  # generic_framed_rs485 profile skips UART enforcement so the shared 9600 8N1 UART works.
   - id: framed_rs485_hub
     uart_id: uart_bus
     profile: generic_framed_rs485
     dump_frames: true
     frame_timeout: 50ms
     on_frame:
-      # Decode a 32-bit little-endian bitmask and push to template binary sensors.
+      # Decode a 32-bit little-endian bitmask once; push to multiple template sensors.
       - frame_type: [0x01, 0x02]
         then:
           - lambda: |-
@@ -18,16 +23,29 @@ framed_rs485:
               uint32_t mask = uint32_t(payload[2]) | (uint32_t(payload[3]) << 8) |
                               (uint32_t(payload[4]) << 16) | (uint32_t(payload[5]) << 24);
               id(g_led_mask) = mask;
-              id(on_frame_bit0).publish_state(bool(mask & (1UL << 0)));
-              id(on_frame_bit1).publish_state(bool(mask & (1UL << 1)));
-      # Match all frames: write the first payload byte to a global.
+              id(led_bit0).publish_state(bool(mask & (1UL << 0)));
+              id(led_bit1).publish_state(bool(mask & (1UL << 1)));
+      # Display text decode into a stack buffer then a single std::string at publish time.
+      - frame_type: [0x01, 0x03]
+        then:
+          - lambda: |-
+              char out[32] = {};
+              uint8_t olen = 0;
+              for (size_t i = 3; i < payload.size() && olen < sizeof(out) - 1; i++) {
+                uint8_t b = payload[i] & 0x7F;  // strip blink bit
+                if (b >= 0x20 && b < 0x7F)
+                  out[olen++] = char(b);
+              }
+              id(display_text).publish_state(std::string(out, olen));
+      # Match-every-frame: write the first byte to a global for diagnostics.
       - frame_type: []
         then:
           - lambda: |-
               if (!payload.empty())
                 id(g_led_mask) = payload[0];
 
-  # Second instance: sniffer-only with idle_gap gate and CRC16-Modbus
+  # Hub 2 — sniffer-only with idle_gap gate and CRC16-Modbus. Exercises a different
+  # crc_type, gate mode, queue policy, and the FIFO-with-larger-queue path.
   - id: framed_rs485_hub2
     uart_id: uart_bus
     profile: generic_framed_rs485
@@ -43,7 +61,7 @@ framed_rs485:
       queue_policy: fifo
       max_queue_size: 4
 
-  # Third instance: fixed_delay gate with XOR8 CRC
+  # Hub 3 — fixed_delay gate with XOR8 CRC and an idle_command set.
   - id: framed_rs485_hub3
     uart_id: uart_bus
     profile: generic_framed_rs485
@@ -53,143 +71,60 @@ framed_rs485:
       gate:
         mode: fixed_delay
         interval: 500ms
+      idle_command: 0x00
 
 binary_sensor:
-  # Template sensors driven by on_frame: above — no per-sensor lambda needed.
+  # User RX decoding is done entirely through on_frame: + template sensors.
   - platform: template
-    id: on_frame_bit0
-    name: "On Frame Bit 0"
+    id: led_bit0
+    name: "LED Bit 0"
 
   - platform: template
-    id: on_frame_bit1
-    name: "On Frame Bit 1"
+    id: led_bit1
+    name: "LED Bit 1"
 
-  # Lambda mode: read bit 0 of a 32-bit little-endian mask at bytes 2-5.
+text_sensor:
+  # User text decoding via on_frame: + template text_sensor.
+  - platform: template
+    id: display_text
+    name: "Display Text"
+
+  # Diagnostic: most recent validated frame type as 4-hex string.
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
-    name: "Lights"
-    frame_type: [0x01, 0x02]
-    lambda: |-
-      if (payload.size() < 6) return {};
-      uint32_t mask = uint32_t(payload[2]) | (uint32_t(payload[3]) << 8) |
-                      (uint32_t(payload[4]) << 16) | (uint32_t(payload[5]) << 24);
-      return bool(mask & (1UL << 0));
-
-  # Latching text-match mode with a custom text extractor.
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
-    name: "Heater Auto Mode"
-    frame_type: [0x01, 0x03]
-    text_lambda: |-
-      std::string out;
-      for (size_t i = 3; i < payload.size(); i++) {
-        uint8_t b = payload[i];
-        if (b >= 0x20 && b < 0x7F) out.push_back(char(b));
-      }
-      return out;
-    match_on: ["Heater", "Auto"]
-    match_off: ["Heater", "Manual"]
-    timeout: 60s
-
-  # Latching text-match using the default ASCII extractor (no text_lambda).
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
-    name: "Pump Running"
-    frame_type: [0x01, 0x04]
-    match_on: ["Pump"]
-    match_off: ["Idle"]
-
-  # Direct lambda returning optional<bool>.
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
-    name: "Custom Flag"
-    frame_type: [0x12, 0x34]
-    lambda: |-
-      if (payload.size() < 3) return {};
-      return bool(payload[2] & 0x01);
+    name: "Last Frame Type"
 
 sensor:
-  # Lambda decode: read a signed byte and publish as float.
+  # Diagnostic counters. publish_state deduplicates so steady-state buses don't spam.
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
-    name: "Pool Temp"
-    frame_type: [0x01, 0x03]
-    lambda: |-
-      if (payload.size() < 4) return {};
-      return float(int8_t(payload[3]));
+    name: "Frames Received"
+    decode: frames_received
 
-  # Built-in generic decode modes.
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
-    name: "Raw Uint8"
-    frame_type: [0x01, 0x05]
-    decode: uint8
-    offset: 2
-
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
-    name: "Raw Uint16 BE"
-    frame_type: [0x01, 0x06]
-    decode: uint16_be
-    offset: 2
-
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
-    name: "BCD Value"
-    frame_type: [0x01, 0x07]
-    decode: bcd
-    offset: 2
-
-  # Diagnostic counters.
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
     name: "CRC Failures"
-    frame_type: []
     decode: crc_failures
-    entity_category: diagnostic
-    accuracy_decimals: 0
-    state_class: total_increasing
+
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Commands Sent"
+    decode: commands_sent
+
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Command Drops"
+    decode: command_drops
+
+  - platform: framed_rs485
+    framed_rs485_id: framed_rs485_hub
+    name: "Last Keepalive ms"
+    decode: last_keepalive_ms
 
   - platform: framed_rs485
     framed_rs485_id: framed_rs485_hub
     name: "Queue Depth"
-    frame_type: []
     decode: queue_depth
-    entity_category: diagnostic
-    state_class: measurement
-    accuracy_decimals: 0
-
-text_sensor:
-  # Lambda decode: strip non-printable bytes and return ASCII string.
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
-    name: "Display"
-    frame_type: [0x01, 0x03]
-    lambda: |-
-      std::string out;
-      for (auto b : payload)
-        if (b >= 0x20 && b < 0x7F) out.push_back(char(b));
-      return out;
-
-  # Lambda decode: strip blink bits (bit 7) before extracting ASCII.
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
-    name: "Display With Blink"
-    frame_type: [0x01, 0x03]
-    lambda: |-
-      std::string out;
-      for (auto b : payload) {
-        uint8_t c = b & 0x7F;
-        if (c >= 0x20 && c < 0x7F) out.push_back(char(c));
-      }
-      return out;
-
-  # Built-in: publish the last received frame type as hex (e.g. "01 02").
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
-    name: "Last Frame Type"
-    frame_type: []
-    entity_category: diagnostic
 
 button:
   - platform: framed_rs485
