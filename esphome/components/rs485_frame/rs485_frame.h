@@ -6,6 +6,10 @@
 #include "esphome/core/log.h"
 #include "esphome/components/uart/uart.h"
 
+#ifdef USE_RS485_FRAME_SNIFFER_STATS
+#include "sniffer_stats.h"
+#endif
+
 #include <memory>
 #include <vector>
 
@@ -136,6 +140,16 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   void set_max_frame_length(uint32_t length) { this->max_frame_length_ = length; }
   void set_in_frame_timeout(uint32_t ms) { this->in_frame_timeout_ms_ = ms; }
 
+#ifdef USE_RS485_FRAME_SNIFFER_STATS
+  // Owns the SnifferStats accumulator. Called once from to_code when the sniffer_stats:
+  // YAML block is present; subsequent record() / tick() calls run on the hot path.
+  void enable_sniffer_stats(size_t max_entries, uint32_t interval_ms, uint8_t payload_dump_top,
+                            const std::vector<uint8_t> &reference_frame_type) {
+    this->sniffer_stats_ = std::make_unique<SnifferStats>();
+    this->sniffer_stats_->init(max_entries, interval_ms, payload_dump_top, reference_frame_type);
+  }
+#endif
+
   bool queue_command_value(uint32_t command);
   bool queue_raw_frame(const std::vector<uint8_t> &payload);
   void register_trigger(RS485FrameTrigger *trigger) { this->triggers_.push_back(trigger); }
@@ -236,6 +250,12 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   // last_frame_type diagnostic publishes the first two bytes of the payload as hex; longer
   // frame_type prefixes still match correctly but the diagnostic only shows the first two.
   char last_frame_type_[5]{};
+
+#ifdef USE_RS485_FRAME_SNIFFER_STATS
+  // nullptr unless sniffer_stats: was present in YAML. The hot path is a single null check
+  // in process_raw_frame_; production builds (without the define) pay no cost at all.
+  std::unique_ptr<SnifferStats> sniffer_stats_;
+#endif
 };
 
 }  // namespace esphome::rs485_frame

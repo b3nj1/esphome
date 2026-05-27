@@ -111,6 +111,11 @@ void RS485FrameHub::loop() {
       this->commands_sent_++;
     this->pending_is_idle_ = false;
   }
+
+#ifdef USE_RS485_FRAME_SNIFFER_STATS
+  if (this->sniffer_stats_ != nullptr)
+    this->sniffer_stats_->tick(now);
+#endif
 }
 
 void RS485FrameHub::dump_config() {
@@ -247,6 +252,11 @@ void RS485FrameHub::process_raw_frame_(uint32_t now) {
     if (this->tx_gate_mode_ == TX_GATE_FRAME_TRIGGER)
       this->send_next_(now);
   }
+
+#ifdef USE_RS485_FRAME_SNIFFER_STATS
+  if (this->sniffer_stats_ != nullptr)
+    this->sniffer_stats_->record(this->rx_payload_, now);
+#endif
 
   for (auto *trigger : this->triggers_) {
     if (trigger->matches(this->rx_payload_))

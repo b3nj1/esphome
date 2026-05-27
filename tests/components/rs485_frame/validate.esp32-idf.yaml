@@ -63,6 +63,8 @@ rs485_frame:
     sniffer_only: true
 
   # Generic profile bypasses final_validate UART enforcement so 38400 7E1 is accepted.
+  # Also exercises sniffer_stats: without an explicit reference_frame_type to confirm the
+  # default-to-gate fallback in to_code is reached during config-only validation.
   - id: generic_hub
     uart_id: generic_uart
     profile: generic_rs485_frame
@@ -71,3 +73,4 @@ rs485_frame:
     tx:
       gate:
         mode: idle_gap
+    sniffer_stats: {}

@@ -49,6 +49,8 @@ rs485_frame:
 
   # Hub 2 — sniffer-only with idle_gap gate and CRC16-Modbus. Exercises a different
   # crc_type, gate mode, queue policy, and the FIFO-with-larger-queue path.
+  # Also exercises sniffer_stats: with an explicit reference_frame_type, so the
+  # USE_RS485_FRAME_SNIFFER_STATS gated code paths are compiled by CI.
   - id: rs485_frame_hub2
     uart_id: uart_bus
     profile: generic_rs485_frame
@@ -63,6 +65,11 @@ rs485_frame:
         min_silence: 10ms
       queue_policy: fifo
       max_queue_size: 4
+    sniffer_stats:
+      interval: 10s
+      max_frame_types: 16
+      payload_dump_top: 2
+      reference_frame_type: [0x01, 0x01]
 
   # Hub 3 — fixed_delay gate with XOR8 CRC and an idle_command set.
   - id: rs485_frame_hub3

@@ -49,12 +49,16 @@ CONF_FRAMING = "framing"
 CONF_GATE = "gate"
 CONF_KEY_FORMAT = "key_format"
 CONF_MAX_FRAME_LENGTH = "max_frame_length"
+CONF_MAX_FRAME_TYPES = "max_frame_types"
 CONF_MAX_QUEUE_SIZE = "max_queue_size"
 CONF_MIN_SILENCE = "min_silence"
+CONF_PAYLOAD_DUMP_TOP = "payload_dump_top"
 CONF_PROFILE = "profile"
 CONF_QUEUE_POLICY = "queue_policy"
+CONF_REFERENCE_FRAME_TYPE = "reference_frame_type"
 CONF_RX_ACCEPT = "rx_accept"
 CONF_SNIFFER_ONLY = "sniffer_only"
+CONF_SNIFFER_STATS = "sniffer_stats"
 CONF_STX = "stx"
 CONF_ON_FRAME = "on_frame"
 CONF_IDLE_COMMAND = "idle_command"
@@ -207,6 +211,11 @@ TX_GATE_SCHEMA = cv.Schema(
 MAX_FRAME_LENGTH_UPPER = 1024
 # Upper bound for max_queue_size with FIFO. Replace_latest is independently constrained to 1.
 MAX_QUEUE_SIZE_UPPER = 32
+# Upper bound for sniffer_stats max_frame_types. Must agree with SNIFFER_MAX_FRAME_TYPES_UPPER
+# in sniffer_stats.h — the C++ side caps the FixedVector capacity at that constant, so a
+# larger schema value would silently truncate. Each entry is ~140 bytes; 64 caps the table
+# at ~9 KB plus the FixedVector header.
+SNIFFER_MAX_FRAME_TYPES_UPPER = 64
 
 TX_SCHEMA = cv.Schema(
     {
@@ -219,6 +228,26 @@ TX_SCHEMA = cv.Schema(
             min=1, max=MAX_QUEUE_SIZE_UPPER
         ),
         cv.Optional(CONF_IDLE_COMMAND): validate_u32,
+    }
+)
+
+# Schema for sniffer_stats: — an optional diagnostic that buckets RX frames by frame_type
+# and logs cadence + unique-payload histograms on a periodic interval. Compiled out unless
+# the YAML block is present (see USE_RS485_FRAME_SNIFFER_STATS in sniffer_stats.h).
+SNIFFER_STATS_SCHEMA = cv.Schema(
+    {
+        cv.Optional(CONF_INTERVAL, default="30s"): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_MAX_FRAME_TYPES, default=32): cv.int_range(
+            min=1, max=SNIFFER_MAX_FRAME_TYPES_UPPER
+        ),
+        # payload_dump_top=0 disables the hex/ASCII dump that follows the table; only the
+        # summary row per frame_type is logged in that case. Capped at MAX_QUEUE_SIZE_UPPER
+        # (32) just to keep log volume bounded — there is no inherent upper limit.
+        cv.Optional(CONF_PAYLOAD_DUMP_TOP, default=0): cv.int_range(min=0, max=32),
+        # reference_frame_type defaults to the active tx.gate.frame_type (typically the
+        # bus keep-alive) when omitted; supplied here when you want d-ref measured against
+        # something other than the gate.
+        cv.Optional(CONF_REFERENCE_FRAME_TYPE): validate_frame_type,
     }
 )
 
@@ -309,6 +338,7 @@ CONFIG_SCHEMA = cv.All(
                     cv.Required(CONF_FRAME_TYPE): validate_frame_type,
                 }
             ),
+            cv.Optional(CONF_SNIFFER_STATS): SNIFFER_STATS_SCHEMA,
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
@@ -413,4 +443,18 @@ async def to_code(config):
                 )
             ],
             conf,
+        )
+
+    if (stats := config.get(CONF_SNIFFER_STATS)) is not None:
+        # cg.add_define gates the SnifferStats field, includes, and hot-path call out of
+        # builds that don't use sniffer_stats — production firmware pays no cost at all.
+        cg.add_define("USE_RS485_FRAME_SNIFFER_STATS")
+        ref = stats.get(CONF_REFERENCE_FRAME_TYPE, gate[CONF_FRAME_TYPE])
+        cg.add(
+            var.enable_sniffer_stats(
+                stats[CONF_MAX_FRAME_TYPES],
+                stats[CONF_INTERVAL].total_milliseconds,
+                stats[CONF_PAYLOAD_DUMP_TOP],
+                ref,
+            )
         )
