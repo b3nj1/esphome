@@ -25,13 +25,16 @@ framed_rs485:
               id(g_led_mask) = mask;
               id(led_bit0).publish_state(bool(mask & (1UL << 0)));
               id(led_bit1).publish_state(bool(mask & (1UL << 1)));
-      # Display text decode into a stack buffer then a single std::string at publish time.
+      # Display text decode into a static (BSS-allocated) buffer then a single
+      # std::string at publish time. static: allocated once at program start so the
+      # lambda inherits the hub's no-heap-after-setup discipline.
       - frame_type: [0x01, 0x03]
         then:
           - lambda: |-
-              char out[32] = {};
+              const size_t BUF_LEN = 128;
+              static char out[BUF_LEN];
               uint8_t olen = 0;
-              for (size_t i = 3; i < payload.size() && olen < sizeof(out) - 1; i++) {
+              for (size_t i = 3; i < payload.size() && olen < (BUF_LEN - 1); i++) {
                 uint8_t b = payload[i] & 0x7F;  // strip blink bit
                 if (b >= 0x20 && b < 0x7F)
                   out[olen++] = char(b);

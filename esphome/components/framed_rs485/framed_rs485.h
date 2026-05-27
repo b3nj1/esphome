@@ -73,8 +73,16 @@ enum TxGateMode {
 class FramedRS485Hub;
 
 /// Automation trigger fired by the hub when a frame matching the configured frame_type
-/// is received. The full decoded payload is passed as the automation argument `payload`:
-/// bytes 0–1 are the two-byte frame type, bytes 2+ are the frame data.
+/// is received. The full decoded payload is passed as the automation argument `payload`.
+///
+/// **Offset convention: payload-relative.** `payload[0..N-1]` are the N-byte frame_type
+/// prefix (typically 2 bytes); data starts at `payload[N]`. DLE+STX, escape bytes, and
+/// CRC are already stripped by validate_frame_() — the lambda sees only the unescaped
+/// frame contents between (but excluding) the framing delimiters.
+///
+/// Community references may strip the frame_type before counting (so their "byte 0" is
+/// our `payload[2]`). See the framed_rs485 docs' "Offset convention" section for the
+/// translation table when porting offsets from external research.
 ///
 /// The trigger holds its own frame_type prefix (StaticVector to avoid heap allocation)
 /// and is registered with the hub via register_trigger().

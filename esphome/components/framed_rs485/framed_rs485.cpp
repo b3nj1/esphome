@@ -287,6 +287,11 @@ bool FramedRS485Hub::validate_frame_() {
   if (this->rx_unescaped_.size() < 2 + crc_len)
     return false;
 
+  // rx_payload_ is what on_frame: triggers and the frame_type_equals_ gate see. It begins
+  // with the frame_type bytes (payload-relative: payload[0..N-1] = frame_type, data starts
+  // at payload[N]) and ends just before the CRC. DLE+STX/DLE+ETX framing is excluded;
+  // escape bytes are unwrapped. This convention is documented for users in the
+  // framed_rs485 docs' "Offset convention" section.
   this->rx_payload_.assign(this->rx_unescaped_.begin(), this->rx_unescaped_.end() - crc_len);
   if (crc_len == 0)
     return true;
