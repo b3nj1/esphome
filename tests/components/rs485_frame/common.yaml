@@ -6,12 +6,12 @@ globals:
     type: std::string
     initial_value: '""'
 
-framed_rs485:
+rs485_frame:
   # Hub 1 — exercises on_frame: triggers + diagnostic sensors + button + number.
-  # generic_framed_rs485 profile skips UART enforcement so the shared 9600 8N1 UART works.
-  - id: framed_rs485_hub
+  # generic_rs485_frame profile skips UART enforcement so the shared 9600 8N1 UART works.
+  - id: rs485_frame_hub
     uart_id: uart_bus
-    profile: generic_framed_rs485
+    profile: generic_rs485_frame
     dump_frames: true
     frame_timeout: 50ms
     on_frame:
@@ -49,9 +49,9 @@ framed_rs485:
 
   # Hub 2 — sniffer-only with idle_gap gate and CRC16-Modbus. Exercises a different
   # crc_type, gate mode, queue policy, and the FIFO-with-larger-queue path.
-  - id: framed_rs485_hub2
+  - id: rs485_frame_hub2
     uart_id: uart_bus
-    profile: generic_framed_rs485
+    profile: generic_rs485_frame
     sniffer_only: true
     crc:
       type: crc16_modbus
@@ -65,9 +65,9 @@ framed_rs485:
       max_queue_size: 4
 
   # Hub 3 — fixed_delay gate with XOR8 CRC and an idle_command set.
-  - id: framed_rs485_hub3
+  - id: rs485_frame_hub3
     uart_id: uart_bus
-    profile: generic_framed_rs485
+    profile: generic_rs485_frame
     crc:
       type: xor8
     tx:
@@ -93,51 +93,51 @@ text_sensor:
     name: "Display Text"
 
   # Diagnostic: most recent validated frame type as 4-hex string.
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
+  - platform: rs485_frame
+    rs485_frame_id: rs485_frame_hub
     name: "Last Frame Type"
 
 sensor:
   # Diagnostic counters. publish_state deduplicates so steady-state buses don't spam.
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
+  - platform: rs485_frame
+    rs485_frame_id: rs485_frame_hub
     name: "Frames Received"
     decode: frames_received
 
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
+  - platform: rs485_frame
+    rs485_frame_id: rs485_frame_hub
     name: "CRC Failures"
     decode: crc_failures
 
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
+  - platform: rs485_frame
+    rs485_frame_id: rs485_frame_hub
     name: "Commands Sent"
     decode: commands_sent
 
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
+  - platform: rs485_frame
+    rs485_frame_id: rs485_frame_hub
     name: "Command Drops"
     decode: command_drops
 
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
+  - platform: rs485_frame
+    rs485_frame_id: rs485_frame_hub
     name: "Last Keepalive ms"
     decode: last_keepalive_ms
 
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
+  - platform: rs485_frame
+    rs485_frame_id: rs485_frame_hub
     name: "Queue Depth"
     decode: queue_depth
 
 button:
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
+  - platform: rs485_frame
+    rs485_frame_id: rs485_frame_hub
     name: "Lights Toggle"
     command: 0x00010000
 
 number:
-  - platform: framed_rs485
-    framed_rs485_id: framed_rs485_hub
+  - platform: rs485_frame
+    rs485_frame_id: rs485_frame_hub
     name: "VSP Speed"
     min_value: 0
     max_value: 100

@@ -1,20 +1,20 @@
-#include "framed_rs485.h"
+#include "rs485_frame.h"
 
 #include "esphome/core/application.h"
 
 #ifdef USE_BUTTON
-#include "button/framed_rs485_button.h"
+#include "button/rs485_frame_button.h"
 #endif
 #ifdef USE_NUMBER
-#include "number/framed_rs485_number.h"
+#include "number/rs485_frame_number.h"
 #endif
 
 #include <algorithm>
 #include <cinttypes>
 
-namespace esphome::framed_rs485 {
+namespace esphome::rs485_frame {
 
-static const char *const TAG = "framed_rs485";
+static const char *const TAG = "rs485_frame";
 
 static const char *crc_type_str(CrcType t) {
   switch (t) {
@@ -57,7 +57,7 @@ static const char *queue_policy_str(QueuePolicy p) {
   }
 }
 
-bool FramedRS485FrameTrigger::matches(const std::vector<uint8_t> &payload) const {
+bool RS485FrameTrigger::matches(const std::vector<uint8_t> &payload) const {
   if (this->frame_type_.empty())
     return true;
   if (payload.size() < this->frame_type_.size())
@@ -65,7 +65,7 @@ bool FramedRS485FrameTrigger::matches(const std::vector<uint8_t> &payload) const
   return std::equal(this->frame_type_.begin(), this->frame_type_.end(), payload.begin());
 }
 
-void FramedRS485Hub::setup() {
+void RS485FrameHub::setup() {
   // Pre-allocate scratch buffers to avoid per-frame heap churn on the main receive path.
   const size_t tx_slot_capacity = this->max_frame_length_ * 2 + FRAME_OVERHEAD_BYTES;
   this->raw_frame_.reserve(this->max_frame_length_);
@@ -85,7 +85,7 @@ void FramedRS485Hub::setup() {
   this->hex_log_buf_ = std::make_unique<char[]>(this->hex_log_buf_size_);
 }
 
-void FramedRS485Hub::loop() {
+void RS485FrameHub::loop() {
   const uint32_t now = App.get_loop_component_start_time();
   this->read_uart_(now);
 
@@ -113,13 +113,13 @@ void FramedRS485Hub::loop() {
   }
 }
 
-void FramedRS485Hub::dump_config() {
+void RS485FrameHub::dump_config() {
   // StaticVector caps the size at MAX_FRAME_TYPE_LEN, so no run-time bound needed.
   char gate_hex[format_hex_size(MAX_FRAME_TYPE_LEN)];
   format_hex_to(gate_hex, this->tx_gate_frame_type_.data(), this->tx_gate_frame_type_.size());
   // Consolidated multi-line ESP_LOGCONFIG (matches modbus_server style) to save flash.
   ESP_LOGCONFIG(TAG,
-                "Framed RS-485:\n"
+                "RS485 Frame:\n"
                 "  Framing: DLE=0x%02x STX=0x%02x ETX=0x%02x ESC=0x%02x\n"
                 "  CRC type: %s, accept header CRC: %s, accept payload CRC: %s\n"
                 "  TX gate: %s, gate frame: %s, gate delay: %" PRIu32 "ms\n"
@@ -135,14 +135,14 @@ void FramedRS485Hub::dump_config() {
                 YESNO(this->dump_frames_));
 }
 
-void FramedRS485Hub::set_framing(uint8_t dle, uint8_t stx, uint8_t etx, uint8_t escape_byte) {
+void RS485FrameHub::set_framing(uint8_t dle, uint8_t stx, uint8_t etx, uint8_t escape_byte) {
   this->dle_ = dle;
   this->stx_ = stx;
   this->etx_ = etx;
   this->escape_byte_ = escape_byte;
 }
 
-bool FramedRS485Hub::queue_command_value(uint32_t command) {
+bool RS485FrameHub::queue_command_value(uint32_t command) {
   if (this->sniffer_only_) {
     ESP_LOGW(TAG, "Ignoring command because sniffer_only is enabled");
     this->command_drops_++;
@@ -153,10 +153,10 @@ bool FramedRS485Hub::queue_command_value(uint32_t command) {
   return this->enqueue_frame_();
 }
 
-bool FramedRS485Hub::enqueue_frame_() {
+bool RS485FrameHub::enqueue_frame_() {
   if (this->queue_policy_ == QUEUE_REPLACE_LATEST) {
     if (this->queue_size_() > 0 || this->tx_start_pending_) {
-      ESP_LOGW(TAG, "Replacing pending framed_rs485 frame before it was transmitted");
+      ESP_LOGW(TAG, "Replacing pending rs485_frame frame before it was transmitted");
       this->command_drops_++;
     }
     if (this->tx_start_pending_) {
@@ -171,7 +171,7 @@ bool FramedRS485Hub::enqueue_frame_() {
     this->tx_queue_count_ = 0;
   } else {
     if (this->tx_queue_count_ + (this->tx_start_pending_ ? 1 : 0) >= this->max_queue_size_) {
-      ESP_LOGW(TAG, "framed_rs485 frame queue full; dropping frame");
+      ESP_LOGW(TAG, "rs485_frame frame queue full; dropping frame");
       this->command_drops_++;
       return false;
     }
@@ -184,7 +184,7 @@ bool FramedRS485Hub::enqueue_frame_() {
   return true;
 }
 
-void FramedRS485Hub::read_uart_(uint32_t now) {
+void RS485FrameHub::read_uart_(uint32_t now) {
   uint8_t byte;
   while (this->available() && this->read_byte(&byte)) {
     this->last_rx_time_ = now;
@@ -222,7 +222,7 @@ void FramedRS485Hub::read_uart_(uint32_t now) {
   }
 }
 
-void FramedRS485Hub::process_raw_frame_(uint32_t now) {
+void RS485FrameHub::process_raw_frame_(uint32_t now) {
   if (!this->validate_frame_()) {
     this->crc_failures_++;
     return;
@@ -254,7 +254,7 @@ void FramedRS485Hub::process_raw_frame_(uint32_t now) {
   }
 }
 
-bool FramedRS485Hub::validate_frame_() {
+bool RS485FrameHub::validate_frame_() {
   const auto &frame = this->raw_frame_;
   // Minimum valid frame: DLE(1)+STX(1) + frame_type(2) + CRC_1byte_min(1) + DLE(1)+ETX(1) = 7
   // but sum16 (2-byte CRC) gives minimum 8. The constant 6 is the no-CRC minimum and is the
@@ -291,7 +291,7 @@ bool FramedRS485Hub::validate_frame_() {
   // with the frame_type bytes (payload-relative: payload[0..N-1] = frame_type, data starts
   // at payload[N]) and ends just before the CRC. DLE+STX/DLE+ETX framing is excluded;
   // escape bytes are unwrapped. This convention is documented for users in the
-  // framed_rs485 docs' "Offset convention" section.
+  // rs485_frame docs' "Offset convention" section.
   this->rx_payload_.assign(this->rx_unescaped_.begin(), this->rx_unescaped_.end() - crc_len);
   if (crc_len == 0)
     return true;
@@ -311,7 +311,7 @@ bool FramedRS485Hub::validate_frame_() {
   return header_ok || payload_ok;
 }
 
-uint16_t FramedRS485Hub::calculate_crc_(const std::vector<uint8_t> &payload, bool include_header) const {
+uint16_t RS485FrameHub::calculate_crc_(const std::vector<uint8_t> &payload, bool include_header) const {
   if (this->crc_type_ == CRC_TYPE_NONE)
     return 0;
 
@@ -356,7 +356,7 @@ uint16_t FramedRS485Hub::calculate_crc_(const std::vector<uint8_t> &payload, boo
   return this->crc_type_ == CRC_TYPE_SUM8 ? (sum & 0xFF) : (sum & 0xFFFF);
 }
 
-size_t FramedRS485Hub::crc_length_() const {
+size_t RS485FrameHub::crc_length_() const {
   switch (this->crc_type_) {
     case CRC_TYPE_NONE:
       return 0;
@@ -373,7 +373,7 @@ size_t FramedRS485Hub::crc_length_() const {
   }
 }
 
-void FramedRS485Hub::escape_dle_(const std::vector<uint8_t> &data, std::vector<uint8_t> &out) const {
+void RS485FrameHub::escape_dle_(const std::vector<uint8_t> &data, std::vector<uint8_t> &out) const {
   out.clear();
   // Worst case: every byte equals DLE and requires an escape byte → 2× input size.
   out.reserve(data.size() * 2);
@@ -384,7 +384,7 @@ void FramedRS485Hub::escape_dle_(const std::vector<uint8_t> &data, std::vector<u
   }
 }
 
-void FramedRS485Hub::build_frame_(const std::vector<uint8_t> &payload, std::vector<uint8_t> &out) {
+void RS485FrameHub::build_frame_(const std::vector<uint8_t> &payload, std::vector<uint8_t> &out) {
   out.clear();
   out.push_back(this->dle_);
   out.push_back(this->stx_);
@@ -415,7 +415,7 @@ void FramedRS485Hub::build_frame_(const std::vector<uint8_t> &payload, std::vect
   out.push_back(this->etx_);
 }
 
-void FramedRS485Hub::build_key_payload_(uint32_t command, std::vector<uint8_t> &out) const {
+void RS485FrameHub::build_key_payload_(uint32_t command, std::vector<uint8_t> &out) const {
   out.clear();
   if (this->key_format_ == KEY_FORMAT_WIRELESS_12BYTE) {
     // Hayward wireless remote frame type 0x0083: 3-byte header + 4-byte key × 2 + 1 pad byte = 12 bytes.
@@ -461,7 +461,7 @@ void FramedRS485Hub::build_key_payload_(uint32_t command, std::vector<uint8_t> &
   out.push_back(0x00);
 }
 
-void FramedRS485Hub::maybe_tx_(uint32_t now) {
+void RS485FrameHub::maybe_tx_(uint32_t now) {
   if (this->sniffer_only_ || this->tx_start_pending_)
     return;
   // For idle_gap and fixed_delay modes, fire the gate regardless of queue depth so that
@@ -478,20 +478,20 @@ void FramedRS485Hub::maybe_tx_(uint32_t now) {
     this->send_next_(now);
 }
 
-void FramedRS485Hub::queue_pop_front_() {
+void RS485FrameHub::queue_pop_front_() {
   // Clear the slot content but keep its reserved capacity for the next enqueue swap.
   this->tx_queue_[this->tx_queue_head_].clear();
   this->tx_queue_head_ = (this->tx_queue_head_ + 1) % this->max_queue_size_;
   this->tx_queue_count_--;
 }
 
-void FramedRS485Hub::write_frame_(const std::vector<uint8_t> &frame) {
+void RS485FrameHub::write_frame_(const std::vector<uint8_t> &frame) {
   this->write_array(frame);
 #ifdef USE_ARDUINO
   // On Arduino paths the uart component does not drive flow_control_pin, so users must
   // run on auto-DE transceivers (DE follows the TX line state). flush() prevents the
   // function from returning before bytes are physically on the wire so the transceiver
-  // does not flip back to RX mid-frame. On ESP-IDF the hardware RS-485 half-duplex mode
+  // does not flip back to RX mid-frame. On ESP-IDF the hardware RS485 half-duplex mode
   // drives DE/RE from the shift-register-done signal; flush() there is pure busy-wait
   // and is omitted to keep loop() responsive.
   this->flush();
@@ -503,7 +503,7 @@ void FramedRS485Hub::write_frame_(const std::vector<uint8_t> &frame) {
   }
 }
 
-void FramedRS485Hub::send_next_(uint32_t now) {
+void RS485FrameHub::send_next_(uint32_t now) {
   if (this->sniffer_only_ || this->tx_start_pending_)
     return;
   if (this->queue_size_() == 0) {
@@ -528,7 +528,7 @@ void FramedRS485Hub::send_next_(uint32_t now) {
   this->commands_sent_++;
 }
 
-void FramedRS485Hub::send_next_idle_(uint32_t now) {
+void RS485FrameHub::send_next_idle_(uint32_t now) {
   this->build_key_payload_(this->idle_command_, this->tx_payload_buf_);
   this->build_frame_(this->tx_payload_buf_, this->tx_frame_buf_);
   if (this->tx_gate_delay_ > 0) {
@@ -543,7 +543,7 @@ void FramedRS485Hub::send_next_idle_(uint32_t now) {
   // Idle keepalives are not counted in commands_sent_ — that counter tracks only real HA commands.
 }
 
-bool FramedRS485Hub::queue_raw_frame(const std::vector<uint8_t> &payload) {
+bool RS485FrameHub::queue_raw_frame(const std::vector<uint8_t> &payload) {
   if (this->sniffer_only_) {
     ESP_LOGW(TAG, "Ignoring raw frame because sniffer_only is enabled");
     this->command_drops_++;
@@ -553,24 +553,24 @@ bool FramedRS485Hub::queue_raw_frame(const std::vector<uint8_t> &payload) {
   return this->enqueue_frame_();
 }
 
-bool FramedRS485Hub::frame_type_equals_(const std::vector<uint8_t> &payload,
-                                        const StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> &frame_type) const {
+bool RS485FrameHub::frame_type_equals_(const std::vector<uint8_t> &payload,
+                                       const StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> &frame_type) const {
   if (frame_type.empty() || payload.size() < frame_type.size())
     return false;
   return std::equal(frame_type.begin(), frame_type.end(), payload.begin());
 }
 
-void FramedRS485Hub::update_last_frame_type_() {
+void RS485FrameHub::update_last_frame_type_() {
   size_t len = std::min(this->rx_payload_.size(), size_t(2));
   format_hex_to(this->last_frame_type_, this->rx_payload_.data(), len);
 }
 
 #ifdef USE_BUTTON
-void FramedRS485Button::press_action() { this->parent_->queue_command_value(this->command_value_); }
+void RS485FrameButton::press_action() { this->parent_->queue_command_value(this->command_value_); }
 #endif  // USE_BUTTON
 
 #ifdef USE_NUMBER
-void FramedRS485Number::control(float value) {
+void RS485FrameNumber::control(float value) {
   if (this->lambda_ == nullptr)
     return;
   auto payload = this->lambda_(value);
@@ -581,4 +581,4 @@ void FramedRS485Number::control(float value) {
 }
 #endif  // USE_NUMBER
 
-}  // namespace esphome::framed_rs485
+}  // namespace esphome::rs485_frame

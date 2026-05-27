@@ -9,7 +9,7 @@
 #include <memory>
 #include <vector>
 
-namespace esphome::framed_rs485 {
+namespace esphome::rs485_frame {
 
 // Maximum number of bytes in a frame-type prefix (schema cap: cv.Length(max=8)).
 // StaticVector template parameters and the Python cv.Length(max=) validator must agree.
@@ -23,7 +23,7 @@ static constexpr size_t FRAME_OVERHEAD_BYTES = 8;
 // constant buys room for future key formats without re-tuning the buffer reserve.
 static constexpr size_t MAX_KEY_PAYLOAD_LEN = 16;
 
-/// Diagnostic value exposed by the framed_rs485 sensor/text_sensor platforms.
+/// Diagnostic value exposed by the rs485_frame sensor/text_sensor platforms.
 /// These are hub state, not user payload decoding — user decoding is done via on_frame:.
 enum SensorDecode {
   SENSOR_DECODE_FRAMES_RECEIVED,    ///< Running count of validated RX frames.
@@ -70,7 +70,7 @@ enum TxGateMode {
   TX_GATE_FIXED_DELAY,    ///< Transmit on a fixed periodic interval.
 };
 
-class FramedRS485Hub;
+class RS485FrameHub;
 
 /// Automation trigger fired by the hub when a frame matching the configured frame_type
 /// is received. The full decoded payload is passed as the automation argument `payload`.
@@ -81,7 +81,7 @@ class FramedRS485Hub;
 /// frame contents between (but excluding) the framing delimiters.
 ///
 /// Community references may strip the frame_type before counting (so their "byte 0" is
-/// our `payload[2]`). See the framed_rs485 docs' "Offset convention" section for the
+/// our `payload[2]`). See the rs485_frame docs' "Offset convention" section for the
 /// translation table when porting offsets from external research.
 ///
 /// The trigger holds its own frame_type prefix (StaticVector to avoid heap allocation)
@@ -90,7 +90,7 @@ class FramedRS485Hub;
 /// Note: build_callback_automation() (preferred by CLAUDE.md for stateless triggers)
 /// cannot be used because the trigger must carry its own frame_type filter for the hub
 /// to dispatch against. A full Trigger subclass is justified.
-class FramedRS485FrameTrigger : public Trigger<const std::vector<uint8_t> &> {
+class RS485FrameTrigger : public Trigger<const std::vector<uint8_t> &> {
  public:
   void set_frame_type(const std::vector<uint8_t> &frame_type) {
     this->frame_type_.assign(frame_type.begin(), frame_type.end());
@@ -101,11 +101,11 @@ class FramedRS485FrameTrigger : public Trigger<const std::vector<uint8_t> &> {
   StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> frame_type_;
 };
 
-/// Central hub for a DLE-framed RS-485 bus. Owns the UART framer, TX queue,
+/// Central hub for a DLE-framed RS485 bus. Owns the UART framer, TX queue,
 /// CRC engine, and the on_frame: trigger registry. User payload decoding is done
 /// via on_frame: triggers and globals/template sensors — this class no longer
 /// dispatches to per-platform listener subclasses.
-class FramedRS485Hub : public Component, public uart::UARTDevice {
+class RS485FrameHub : public Component, public uart::UARTDevice {
  public:
   void setup() override;
   void loop() override;
@@ -138,7 +138,7 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
 
   bool queue_command_value(uint32_t command);
   bool queue_raw_frame(const std::vector<uint8_t> &payload);
-  void register_trigger(FramedRS485FrameTrigger *trigger) { this->triggers_.push_back(trigger); }
+  void register_trigger(RS485FrameTrigger *trigger) { this->triggers_.push_back(trigger); }
 
   uint32_t get_frames_received() const { return this->frames_received_; }
   uint32_t get_crc_failures() const { return this->crc_failures_; }
@@ -191,7 +191,7 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   uint32_t max_frame_length_{128};
   uint32_t in_frame_timeout_ms_{50};
 
-  std::vector<FramedRS485FrameTrigger *> triggers_;
+  std::vector<RS485FrameTrigger *> triggers_;
   // Ring buffer: pre-sized and pre-reserved in setup() to avoid per-frame heap allocation.
   // Slots are swapped with tx_frame_buf_ on enqueue (no copy). Max slot size is
   // max_frame_length_ * 2 + FRAME_OVERHEAD_BYTES (worst case: all payload bytes are DLE and
@@ -238,4 +238,4 @@ class FramedRS485Hub : public Component, public uart::UARTDevice {
   char last_frame_type_[5]{};
 };
 
-}  // namespace esphome::framed_rs485
+}  // namespace esphome::rs485_frame

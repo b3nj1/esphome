@@ -2,9 +2,9 @@
 
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/core/component.h"
-#include "../framed_rs485.h"
+#include "../rs485_frame.h"
 
-namespace esphome::framed_rs485 {
+namespace esphome::rs485_frame {
 
 /// Diagnostic sensor that publishes a hub state value (frames received, CRC failures,
 /// queue depth, etc.) on change only. User payload decoding is done via on_frame: +
@@ -12,9 +12,9 @@ namespace esphome::framed_rs485 {
 ///
 /// sensor::Sensor::publish_state() deduplicates equal-valued publishes internally, so
 /// a counter that has not advanced does not generate API traffic.
-class FramedRS485Sensor : public sensor::Sensor, public Component {
+class RS485FrameSensor : public sensor::Sensor, public Component {
  public:
-  void set_parent(FramedRS485Hub *parent) { this->parent_ = parent; }
+  void set_parent(RS485FrameHub *parent) { this->parent_ = parent; }
   void set_decode(SensorDecode decode) { this->decode_ = decode; }
 
   void loop() override {
@@ -46,8 +46,8 @@ class FramedRS485Sensor : public sensor::Sensor, public Component {
   float get_setup_priority() const override { return setup_priority::DATA; }
 
  protected:
-  FramedRS485Hub *parent_{nullptr};
+  RS485FrameHub *parent_{nullptr};
   SensorDecode decode_{SENSOR_DECODE_FRAMES_RECEIVED};
 };
 
-}  // namespace esphome::framed_rs485
+}  // namespace esphome::rs485_frame

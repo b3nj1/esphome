@@ -20,23 +20,23 @@ CODEOWNERS = ["@b3nj1"]
 DEPENDENCIES = ["uart"]
 MULTI_CONF = True
 
-framed_rs485_ns = cg.esphome_ns.namespace("framed_rs485")
-FramedRS485Hub = framed_rs485_ns.class_("FramedRS485Hub", cg.Component, uart.UARTDevice)
-FramedRS485FrameTrigger = framed_rs485_ns.class_(
-    "FramedRS485FrameTrigger",
+rs485_frame_ns = cg.esphome_ns.namespace("rs485_frame")
+RS485FrameHub = rs485_frame_ns.class_("RS485FrameHub", cg.Component, uart.UARTDevice)
+RS485FrameTrigger = rs485_frame_ns.class_(
+    "RS485FrameTrigger",
     automation.Trigger.template(
         cg.std_vector.template(cg.uint8).operator("const").operator("ref")
     ),
 )
 
-SensorDecode = framed_rs485_ns.enum("SensorDecode")
-KeyFormat = framed_rs485_ns.enum("KeyFormat")
-CrcVariant = framed_rs485_ns.enum("CrcVariant")
-CrcType = framed_rs485_ns.enum("CrcType")
-QueuePolicy = framed_rs485_ns.enum("QueuePolicy")
-TxGateMode = framed_rs485_ns.enum("TxGateMode")
+SensorDecode = rs485_frame_ns.enum("SensorDecode")
+KeyFormat = rs485_frame_ns.enum("KeyFormat")
+CrcVariant = rs485_frame_ns.enum("CrcVariant")
+CrcType = rs485_frame_ns.enum("CrcType")
+QueuePolicy = rs485_frame_ns.enum("QueuePolicy")
+TxGateMode = rs485_frame_ns.enum("TxGateMode")
 
-CONF_FRAMED_RS485_ID = "framed_rs485_id"
+CONF_RS485_FRAME_ID = "rs485_frame_id"
 CONF_CRC = "crc"
 CONF_DECODE = "decode"
 CONF_DLE = "dle"
@@ -65,7 +65,7 @@ PROFILE_HAYWARD_WIRELESS = "hayward_aqualogic_wireless"
 PROFILE_HAYWARD_WIRED_REMOTE = "hayward_aqualogic_wired_remote"
 PROFILE_HAYWARD_WIRED_LOCAL = "hayward_aqualogic_wired_local"
 PROFILE_JANDY_RS = "jandy_aqualink_rs"
-PROFILE_GENERIC = "generic_framed_rs485"
+PROFILE_GENERIC = "generic_rs485_frame"
 
 KEY_FORMATS = {
     "wireless_12byte": KeyFormat.KEY_FORMAT_WIRELESS_12BYTE,
@@ -119,7 +119,7 @@ def validate_u32(value):
     return HexInt(int(value))
 
 
-# Schema cap matches MAX_FRAME_TYPE_LEN in framed_rs485.h (StaticVector<uint8_t, 8>);
+# Schema cap matches MAX_FRAME_TYPE_LEN in rs485_frame.h (StaticVector<uint8_t, 8>);
 # the StaticVector::assign() truncates silently past N=8, so the schema must enforce the cap.
 def validate_frame_type(value):
     return cv.All(cv.ensure_list(validate_byte), cv.Length(max=8))(value)
@@ -281,7 +281,7 @@ def validate_hub(config):
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
-            cv.GenerateID(): cv.declare_id(FramedRS485Hub),
+            cv.GenerateID(): cv.declare_id(RS485FrameHub),
             cv.Optional(CONF_PROFILE, default=PROFILE_HAYWARD_WIRELESS): cv.one_of(
                 PROFILE_HAYWARD_WIRELESS,
                 PROFILE_HAYWARD_WIRED_REMOTE,
@@ -305,9 +305,7 @@ CONFIG_SCHEMA = cv.All(
             ): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_ON_FRAME): automation.validate_automation(
                 {
-                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(
-                        FramedRS485FrameTrigger
-                    ),
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(RS485FrameTrigger),
                     cv.Required(CONF_FRAME_TYPE): validate_frame_type,
                 }
             ),
@@ -340,7 +338,7 @@ def _final_validate(config):
             # required; the rest default in UART_DEVICE_SCHEMA).
             if uart_config.get(key) != expected:
                 raise cv.Invalid(
-                    f"Framed RS-485 jandy_aqualink_rs profile requires uart {key}: {expected}; "
+                    f"RS485 Frame jandy_aqualink_rs profile requires uart {key}: {expected}; "
                     f"use profile: {PROFILE_GENERIC} for other serial settings"
                 )
         return config
@@ -354,7 +352,7 @@ def _final_validate(config):
     for key, expected in required.items():
         if uart_config.get(key) != expected:
             raise cv.Invalid(
-                f"Framed RS-485 Hayward profiles require uart {key}: {expected}; "
+                f"RS485 Frame Hayward profiles require uart {key}: {expected}; "
                 f"use profile: {PROFILE_GENERIC} for other serial settings"
             )
     return config

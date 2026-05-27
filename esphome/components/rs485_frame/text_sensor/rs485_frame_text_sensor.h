@@ -2,19 +2,19 @@
 
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/component.h"
-#include "../framed_rs485.h"
+#include "../rs485_frame.h"
 
 #include <cstring>
 
-namespace esphome::framed_rs485 {
+namespace esphome::rs485_frame {
 
 /// Diagnostic text_sensor that publishes the most recent validated frame type as a
 /// 4-character hex string ("0083" etc.). Publishes only on change; the publish_state
 /// implementation in text_sensor::TextSensor internally deduplicates so a steady-state
 /// bus produces no API traffic.
-class FramedRS485TextSensor : public text_sensor::TextSensor, public Component {
+class RS485FrameTextSensor : public text_sensor::TextSensor, public Component {
  public:
-  void set_parent(FramedRS485Hub *parent) { this->parent_ = parent; }
+  void set_parent(RS485FrameHub *parent) { this->parent_ = parent; }
 
   void loop() override {
     const char *current = this->parent_->get_last_frame_type();
@@ -29,11 +29,11 @@ class FramedRS485TextSensor : public text_sensor::TextSensor, public Component {
   float get_setup_priority() const override { return setup_priority::DATA; }
 
  protected:
-  FramedRS485Hub *parent_{nullptr};
+  RS485FrameHub *parent_{nullptr};
   // Mirror of the hub's last_frame_type_ buffer so we can detect changes without
   // calling text_sensor::publish_state() (which would still dedupe, but at the cost
   // of constructing a std::string per loop iteration).
   char last_published_[5]{};
 };
 
-}  // namespace esphome::framed_rs485
+}  // namespace esphome::rs485_frame

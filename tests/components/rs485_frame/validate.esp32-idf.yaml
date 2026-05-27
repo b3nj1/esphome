@@ -1,6 +1,6 @@
 ## Config-only validation tests for profile UART enforcement and gate-frame defaults.
 ## These exercise validate_hub() + _final_validate() branches that the regular
-## test.*.yaml configs (which use generic_framed_rs485) do not reach. CI runs this with
+## test.*.yaml configs (which use generic_rs485_frame) do not reach. CI runs this with
 ## `esphome config` only; it is never compiled.
 
 uart:
@@ -22,7 +22,7 @@ uart:
     parity: NONE
     stop_bits: 1
 
-  # Generic UART with deliberately atypical settings — proves generic_framed_rs485
+  # Generic UART with deliberately atypical settings — proves generic_rs485_frame
   # skips final_validate UART enforcement entirely.
   - id: generic_uart
     tx_pin: GPIO21
@@ -32,7 +32,7 @@ uart:
     parity: EVEN
     stop_bits: 1
 
-framed_rs485:
+rs485_frame:
   # Hayward wireless — default key_format wireless_12byte, gate [0x01, 0x01].
   - id: hayward_wireless_hub
     uart_id: hayward_uart
@@ -65,7 +65,7 @@ framed_rs485:
   # Generic profile bypasses final_validate UART enforcement so 38400 7E1 is accepted.
   - id: generic_hub
     uart_id: generic_uart
-    profile: generic_framed_rs485
+    profile: generic_rs485_frame
     crc:
       type: none
     tx:

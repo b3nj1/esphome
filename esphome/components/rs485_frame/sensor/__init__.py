@@ -5,27 +5,27 @@ from esphome.const import ENTITY_CATEGORY_DIAGNOSTIC, STATE_CLASS_TOTAL_INCREASI
 
 from .. import (
     CONF_DECODE,
-    CONF_FRAMED_RS485_ID,
+    CONF_RS485_FRAME_ID,
     SENSOR_DECODES,
-    FramedRS485Hub,
-    framed_rs485_ns,
+    RS485FrameHub,
+    rs485_frame_ns,
 )
 
-AUTO_LOAD = ["framed_rs485"]
+AUTO_LOAD = ["rs485_frame"]
 
-FramedRS485Sensor = framed_rs485_ns.class_(
-    "FramedRS485Sensor", sensor.Sensor, cg.Component
+RS485FrameSensor = rs485_frame_ns.class_(
+    "RS485FrameSensor", sensor.Sensor, cg.Component
 )
 
 
 CONFIG_SCHEMA = sensor.sensor_schema(
-    FramedRS485Sensor,
+    RS485FrameSensor,
     accuracy_decimals=0,
     state_class=STATE_CLASS_TOTAL_INCREASING,
     entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
 ).extend(
     {
-        cv.GenerateID(CONF_FRAMED_RS485_ID): cv.use_id(FramedRS485Hub),
+        cv.GenerateID(CONF_RS485_FRAME_ID): cv.use_id(RS485FrameHub),
         cv.Required(CONF_DECODE): cv.one_of(*SENSOR_DECODES, lower=True),
     }
 )
@@ -34,6 +34,6 @@ CONFIG_SCHEMA = sensor.sensor_schema(
 async def to_code(config):
     var = await sensor.new_sensor(config)
     await cg.register_component(var, config)
-    hub = await cg.get_variable(config[CONF_FRAMED_RS485_ID])
+    hub = await cg.get_variable(config[CONF_RS485_FRAME_ID])
     cg.add(var.set_parent(hub))
     cg.add(var.set_decode(SENSOR_DECODES[config[CONF_DECODE]]))
