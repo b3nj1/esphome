@@ -158,10 +158,15 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
 #ifdef USE_RS485_FRAME_SNIFFER_STATS
   // Owns the SnifferStats accumulator. Called once from to_code when the sniffer_stats:
   // YAML block is present; subsequent record() / tick() calls run on the hot path.
+  // max_unique_payloads + payload_capture_bytes pre-size the per-entry payload buffers
+  // so users can address chatty buses (long display frames, many distinct payloads per
+  // frame_type) from YAML alone without forking the component.
   void enable_sniffer_stats(size_t max_entries, uint32_t interval_ms, uint8_t payload_dump_top,
+                            size_t max_unique_payloads, size_t payload_capture_bytes,
                             const std::vector<uint8_t> &reference_frame_type) {
     this->sniffer_stats_ = std::make_unique<SnifferStats>();
-    this->sniffer_stats_->init(max_entries, interval_ms, payload_dump_top, reference_frame_type);
+    this->sniffer_stats_->init(max_entries, interval_ms, payload_dump_top, max_unique_payloads, payload_capture_bytes,
+                               reference_frame_type);
   }
 #endif
 

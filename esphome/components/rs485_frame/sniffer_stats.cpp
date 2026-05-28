@@ -51,23 +51,40 @@ uint32_t DelayStats::median() const {
   return copy[this->recent_count / 2];
 }
 
+void PayloadCapture::init(size_t capacity) { this->bytes = std::make_unique<uint8_t[]>(capacity); }
+
+void SnifferEntry::init(size_t max_unique_payloads, size_t payload_capture_bytes) {
+  this->payloads = std::make_unique<PayloadCapture[]>(max_unique_payloads);
+  for (size_t i = 0; i < max_unique_payloads; i++) {
+    this->payloads[i].init(payload_capture_bytes);
+  }
+}
+
 void SnifferEntry::reset_period_stats() {
   this->count = 0;
   this->last_seen_ms = 0;
   this->d_ref.reset();
   this->d_same.reset();
-  // Unique payload list and unique_overflow are intentionally preserved across periods —
-  // payload uniqueness is a long-term observation that compounds as more rare payloads
-  // are seen over the session.
+  // Wipe the unique-payload bookkeeping so the next period starts fresh. The payload
+  // byte buffers stay allocated; per-slot len/count past unique_count are stale but
+  // unread until a fresh payload overwrites them in update_unique_payload_.
+  this->unique_count = 0;
+  this->unique_overflow = 0;
 }
 
-void SnifferStats::init(size_t max_entries, uint32_t interval_ms, uint8_t payload_dump_top,
-                        const std::vector<uint8_t> &reference_frame_type) {
+void SnifferStats::init(size_t max_entries, uint32_t interval_ms, uint8_t payload_dump_top, size_t max_unique_payloads,
+                        size_t payload_capture_bytes, const std::vector<uint8_t> &reference_frame_type) {
   size_t capped = max_entries > SNIFFER_MAX_FRAME_TYPES_UPPER ? SNIFFER_MAX_FRAME_TYPES_UPPER : max_entries;
   this->entries_.init(capped);
   this->reference_frame_type_.assign(reference_frame_type.begin(), reference_frame_type.end());
   this->interval_ms_ = interval_ms;
   this->payload_dump_top_ = payload_dump_top;
+  this->max_unique_payloads_ = max_unique_payloads;
+  this->payload_capture_bytes_ = payload_capture_bytes;
+  // Pre-allocate the hex/ASCII scratch buffers used by dump_payloads_ so dumps don't
+  // allocate per-call. Sized to the worst-case captured payload.
+  this->hex_buf_ = std::make_unique<char[]>(payload_capture_bytes * 3 + 1);
+  this->ascii_buf_ = std::make_unique<char[]>(payload_capture_bytes + 1);
   this->initialized_ = true;
 }
 
@@ -83,27 +100,36 @@ SnifferEntry *SnifferStats::find_or_create_(const uint8_t *frame_type) {
       return &this->entries_[i];
   }
   if (this->entries_.size() < this->entries_.capacity()) {
-    SnifferEntry e{};
+    SnifferEntry &e = this->entries_.emplace_back();
     e.frame_type[0] = frame_type[0];
     e.frame_type[1] = frame_type[1];
-    this->entries_.push_back(std::move(e));
-    return &this->entries_[this->entries_.size() - 1];
+    // Lazy allocation: per-entry payload buffers are sized using the current SnifferStats
+    // configuration. This only runs once per distinct frame_type, then never again — the
+    // hot record() path after this allocation is pure memcpy/compare.
+    e.init(this->max_unique_payloads_, this->payload_capture_bytes_);
+    return &e;
   }
   return nullptr;
 }
 
 void SnifferStats::update_unique_payload_(SnifferEntry &e, const std::vector<uint8_t> &payload) {
-  size_t len = payload.size() < SNIFFER_PAYLOAD_CAPTURE_BYTES ? payload.size() : SNIFFER_PAYLOAD_CAPTURE_BYTES;
+  size_t len = payload.size() < this->payload_capture_bytes_ ? payload.size() : this->payload_capture_bytes_;
   for (uint8_t i = 0; i < e.unique_count; i++) {
-    if (e.payloads[i].len == len && std::memcmp(e.payloads[i].bytes, payload.data(), len) == 0) {
-      e.payloads[i].count++;
+    PayloadCapture &slot = e.payloads[i];
+    if (slot.len == len && std::memcmp(slot.bytes.get(), payload.data(), len) == 0) {
+      // Saturate the per-payload count at uint16_t max — a very chatty payload over a
+      // long dump interval can otherwise wrap. The exact count past 65535 doesn't matter
+      // for the discovery use case; "≥65535" is information enough.
+      if (slot.count < UINT16_MAX)
+        slot.count++;
       return;
     }
   }
-  if (e.unique_count < SNIFFER_MAX_UNIQUE_PAYLOADS) {
-    std::memcpy(e.payloads[e.unique_count].bytes, payload.data(), len);
-    e.payloads[e.unique_count].len = static_cast<uint8_t>(len);
-    e.payloads[e.unique_count].count = 0;
+  if (e.unique_count < this->max_unique_payloads_) {
+    PayloadCapture &slot = e.payloads[e.unique_count];
+    std::memcpy(slot.bytes.get(), payload.data(), len);
+    slot.len = static_cast<uint8_t>(len);
+    slot.count = 1;  // first sighting in this period
     e.unique_count++;
   } else if (e.unique_overflow < UINT16_MAX) {
     e.unique_overflow++;
@@ -142,7 +168,7 @@ void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t now) {
     e->d_ref.add(now - this->last_ref_time_);
   }
 
-  update_unique_payload_(*e, payload);
+  this->update_unique_payload_(*e, payload);
 
   e->count++;
   e->last_seen_ms = now;
@@ -227,8 +253,10 @@ void SnifferStats::dump_(uint32_t now) {
              this->entries_.capacity());
   }
 
-  // Per-period counters reset; unique-payload list and unique_overflow persist (see
-  // SnifferEntry::reset_period_stats).
+  // Per-period reset: total frame count, delay stats, AND unique payload list. The
+  // payload list is intentionally cleared every period so the user can use successive
+  // dumps as independent capture windows (press buttons A, dump, press buttons B, dump)
+  // without having to reboot the ESP between sessions.
   for (size_t i = 0; i < n; i++)
     this->entries_[i].reset_period_stats();
   this->dropped_frame_types_ = 0;
@@ -238,9 +266,8 @@ void SnifferStats::dump_(uint32_t now) {
 void SnifferStats::dump_payloads_(size_t top_n, const uint8_t *order) const {
   // Hex/ASCII view of every captured unique payload for the top-N frame types by count.
   // ASCII strips the high bit so Hayward display bytes (blink-flag = bit 7) render as
-  // their underlying character; non-printable bytes are rendered as '.'.
-  char hex_buf[SNIFFER_PAYLOAD_CAPTURE_BYTES * 3 + 1];
-  char ascii_buf[SNIFFER_PAYLOAD_CAPTURE_BYTES + 1];
+  // their underlying character; non-printable bytes are rendered as '.'. Buffers are
+  // preallocated on SnifferStats so the dump path has no heap traffic.
   for (size_t i = 0; i < top_n; i++) {
     const SnifferEntry &e = this->entries_[order[i]];
     if (e.unique_count == 0)
@@ -249,14 +276,14 @@ void SnifferStats::dump_payloads_(size_t top_n, const uint8_t *order) const {
     for (uint8_t k = 0; k < e.unique_count; k++) {
       const PayloadCapture &p = e.payloads[k];
       for (uint8_t b = 0; b < p.len; b++)
-        std::snprintf(hex_buf + b * 3, 4, "%02X ", p.bytes[b]);
-      hex_buf[p.len * 3] = '\0';
+        std::snprintf(this->hex_buf_.get() + b * 3, 4, "%02X ", p.bytes[b]);
+      this->hex_buf_[p.len * 3] = '\0';
       for (uint8_t b = 0; b < p.len; b++) {
         uint8_t c = p.bytes[b] & 0x7F;  // strip Hayward-style blink-bit before ASCII gating
-        ascii_buf[b] = (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '.';
+        this->ascii_buf_[b] = (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '.';
       }
-      ascii_buf[p.len] = '\0';
-      ESP_LOGI(TAG, "    %5d @ %s |%s|", p.count, hex_buf, ascii_buf);
+      this->ascii_buf_[p.len] = '\0';
+      ESP_LOGI(TAG, "    %5u @ %s |%s|", p.count, this->hex_buf_.get(), this->ascii_buf_.get());
     }
   }
 }

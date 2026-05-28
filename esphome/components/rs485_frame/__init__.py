@@ -51,7 +51,9 @@ CONF_KEY_FORMAT = "key_format"
 CONF_MAX_FRAME_LENGTH = "max_frame_length"
 CONF_MAX_FRAME_TYPES = "max_frame_types"
 CONF_MAX_QUEUE_SIZE = "max_queue_size"
+CONF_MAX_UNIQUE_PAYLOADS = "max_unique_payloads"
 CONF_MIN_SILENCE = "min_silence"
+CONF_PAYLOAD_CAPTURE_BYTES = "payload_capture_bytes"
 CONF_PAYLOAD_DUMP_TOP = "payload_dump_top"
 CONF_PROFILE = "profile"
 CONF_QUEUE_POLICY = "queue_policy"
@@ -242,9 +244,19 @@ MAX_FRAME_LENGTH_UPPER = 1024
 MAX_QUEUE_SIZE_UPPER = 32
 # Upper bound for sniffer_stats max_frame_types. Must agree with SNIFFER_MAX_FRAME_TYPES_UPPER
 # in sniffer_stats.h — the C++ side caps the FixedVector capacity at that constant, so a
-# larger schema value would silently truncate. Each entry is ~140 bytes; 64 caps the table
-# at ~9 KB plus the FixedVector header.
+# larger schema value would silently truncate.
 SNIFFER_MAX_FRAME_TYPES_UPPER = 64
+
+# Upper bound for sniffer_stats max_unique_payloads. Per-entry heap allocation grows linearly
+# in this value; 64 is a comfortable ceiling for "lots of distinct display screens" without
+# making it easy to OOM an ESP8266 via a typo.
+SNIFFER_MAX_UNIQUE_PAYLOADS_UPPER = 64
+
+# Upper bound for sniffer_stats payload_capture_bytes. The sniffer truncates each captured
+# payload to this length; 256 covers the widest legal frame in any supported protocol while
+# keeping the table memory bounded. A frame longer than this is still uniquely identified
+# by its first 256 bytes — collisions on the first 256 bytes are astronomically unlikely.
+SNIFFER_PAYLOAD_CAPTURE_BYTES_UPPER = 256
 
 TX_SCHEMA = cv.Schema(
     {
@@ -268,6 +280,18 @@ SNIFFER_STATS_SCHEMA = cv.Schema(
         cv.Optional(CONF_INTERVAL, default="30s"): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_MAX_FRAME_TYPES, default=32): cv.int_range(
             min=1, max=SNIFFER_MAX_FRAME_TYPES_UPPER
+        ),
+        # Per-frame-type unique-payload capacity. Bumped from the original 8 to 16 so
+        # protocols with many display screens or per-button responses don't fill the
+        # bucket immediately and start counting everything into +overflow.
+        cv.Optional(CONF_MAX_UNIQUE_PAYLOADS, default=16): cv.int_range(
+            min=1, max=SNIFFER_MAX_UNIQUE_PAYLOADS_UPPER
+        ),
+        # How many payload bytes are captured per unique sample. 32 covers most decode
+        # use cases including Hayward display frames; bump for AquaLogic / iAqualinkTouch
+        # variants that ship longer frames. Capped at SNIFFER_PAYLOAD_CAPTURE_BYTES_UPPER.
+        cv.Optional(CONF_PAYLOAD_CAPTURE_BYTES, default=32): cv.int_range(
+            min=1, max=SNIFFER_PAYLOAD_CAPTURE_BYTES_UPPER
         ),
         # payload_dump_top=0 disables the hex/ASCII dump that follows the table; only the
         # summary row per frame_type is logged in that case. Capped at MAX_QUEUE_SIZE_UPPER
@@ -488,6 +512,8 @@ async def to_code(config):
                 stats[CONF_MAX_FRAME_TYPES],
                 stats[CONF_INTERVAL].total_milliseconds,
                 stats[CONF_PAYLOAD_DUMP_TOP],
+                stats[CONF_MAX_UNIQUE_PAYLOADS],
+                stats[CONF_PAYLOAD_CAPTURE_BYTES],
                 ref,
             )
         )
