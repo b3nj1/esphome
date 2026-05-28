@@ -146,6 +146,15 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   void set_queue_policy(QueuePolicy policy) { this->queue_policy_ = policy; }
   void set_max_queue_size(uint32_t size) { this->max_queue_size_ = size; }
   void set_key_format(KeyFormat format) { this->key_format_ = format; }
+  // Override the wired-controller sub-type byte (second byte of the wired frame_type).
+  // Only used when key_format is wired_local or wired_remote; ignored otherwise. Lets
+  // users impersonate any wired unit-address (typically 0x02..0x04 for Hayward) without
+  // editing C++ — useful both for matching a specific installation's hardware-select
+  // wiring and for avoiding collisions with the main panel's own keypress traffic.
+  void set_wired_sub_type(uint8_t b) {
+    this->wired_sub_type_override_ = b;
+    this->has_wired_sub_type_override_ = true;
+  }
   void set_idle_command(uint32_t cmd) {
     this->idle_command_ = cmd;
     this->has_idle_command_ = true;
@@ -218,6 +227,11 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   QueuePolicy queue_policy_{QUEUE_REPLACE_LATEST};
   uint32_t max_queue_size_{1};
   KeyFormat key_format_{KEY_FORMAT_WIRELESS_12BYTE};
+  // wired_sub_type override. has_wired_sub_type_override_ stays false unless the user
+  // set the YAML option, in which case build_key_payload_ uses wired_sub_type_override_
+  // in place of the key_format-derived default (0x02 or 0x03).
+  uint8_t wired_sub_type_override_{0};
+  bool has_wired_sub_type_override_{false};
   uint32_t idle_command_{0};
   bool has_idle_command_{false};
   bool dump_frames_{false};

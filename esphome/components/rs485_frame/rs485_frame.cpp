@@ -467,15 +467,38 @@ void RS485FrameHub::build_key_payload_(uint32_t command, std::vector<uint8_t> &o
     return;
   }
 
-  // Hayward wired remote / wired local: 2-byte frame type + 2-byte key + 2 pad bytes.
-  // Sub-type 0x03 = wired remote, 0x02 = wired local (local panel).
+  // Hayward wired remote / wired local: 2-byte frame type + 4-byte command (big-endian) ×
+  // 2 = 10 bytes payload before CRC. Same layout as the wireless 0x0083 form minus the
+  // 1-byte sequence prefix and 1-byte trailing pad — the wired-side controller does not
+  // need either, and the local panel observed on a live bus emits exactly this shape.
+  //
+  // Sub-type 0x02 = wired local (the main keypad on an AquaLogic / ProLogic panel).
+  //   Verified against a live AquaLogic bus 2026-05: pressed Menu / Right / AUX 1 / AUX 2 /
+  //   Heater / Valve 4 on the panel and observed `00 02 [cmd:4 BE] [cmd:4 BE] [sum16:2 BE]`
+  //   frames with the cmd field matching the wireless-remote command map (e.g. 0x00040000
+  //   for AUX 2, 0x00000400 for Heater). The second 4-byte block is the press payload
+  //   repeated; the panel emits the same block zeroed when reporting key release, but
+  //   sending the press-only form is sufficient for the panel to act on the command.
+  //
+  // Sub-type 0x03 = wired remote (the OEM spa-side wired remote, a separate physical
+  //   product on the same bus). Format is extrapolated from wired_local and is not yet
+  //   verified on real hardware; the spa-side remote uses the same command map, so the
+  //   payload structure is expected to be identical with only the frame sub-type byte
+  //   differing. Open an issue if your wired remote does not respond to this format.
   out.push_back(0x00);
-  out.push_back(this->key_format_ == KEY_FORMAT_WIRED_REMOTE ? 0x03 : 0x02);
-  uint16_t key = (command >> 16) & 0xFFFF;
-  out.push_back((key >> 8) & 0xFF);
-  out.push_back(key & 0xFF);
-  out.push_back(0x00);
-  out.push_back(0x00);
+  // Sub-type byte: explicit YAML override wins; otherwise pick the key_format default
+  // (0x03 for wired_remote = "additional registered keypad" — safer, no collision with
+  // main-panel traffic; 0x02 for wired_local = "main panel" — convenient but collides
+  // when the user also presses the physical panel).
+  uint8_t sub_type = this->has_wired_sub_type_override_ ? this->wired_sub_type_override_
+                                                        : (this->key_format_ == KEY_FORMAT_WIRED_REMOTE ? 0x03 : 0x02);
+  out.push_back(sub_type);
+  for (int repeat = 0; repeat < 2; repeat++) {
+    out.push_back((command >> 24) & 0xFF);
+    out.push_back((command >> 16) & 0xFF);
+    out.push_back((command >> 8) & 0xFF);
+    out.push_back(command & 0xFF);
+  }
 }
 
 void RS485FrameHub::maybe_tx_(uint32_t now) {

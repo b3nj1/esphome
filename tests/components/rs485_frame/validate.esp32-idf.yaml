@@ -38,15 +38,18 @@ rs485_frame:
     uart_id: hayward_uart
     profile: hayward_aqualogic_wireless
 
-  # Hayward wired remote — payload-only CRC, key_format wired_remote.
+  # Hayward wired remote — header_inclusive CRC, key_format wired_remote, sub-type 0x03.
   - id: hayward_wired_remote_hub
     uart_id: hayward_uart
     profile: hayward_aqualogic_wired_remote
 
-  # Hayward wired local — payload-only CRC, key_format wired_local.
+  # Hayward wired local — header_inclusive CRC, key_format wired_local, sub-type 0x02.
+  # Exercises the wired_sub_type override too: impersonate unit 3 (0x04) to avoid the
+  # default-0x02 collision with main-panel keypress traffic.
   - id: hayward_wired_local_hub
     uart_id: hayward_uart
     profile: hayward_aqualogic_wired_local
+    wired_sub_type: 0x04
 
   # Jandy AllButton emulator — profile injects gate frame [0x08, 0x00] (AllButton probe)
   # and sum8 header-inclusive CRC. Requires idle_command (enforced by validate_hub).

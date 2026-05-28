@@ -66,6 +66,7 @@ CONF_ON_FRAME = "on_frame"
 CONF_IDLE_COMMAND = "idle_command"
 CONF_TX = "tx"
 CONF_TX_VARIANT = "tx_variant"
+CONF_WIRED_SUB_TYPE = "wired_sub_type"
 
 PROFILE_HAYWARD_WIRELESS = "hayward_aqualogic_wireless"
 PROFILE_HAYWARD_WIRED_REMOTE = "hayward_aqualogic_wired_remote"
@@ -168,14 +169,26 @@ _PROFILE_GATE_FRAME_TYPE = "_gate_frame_type"
 
 def _profile_defaults(profile):
     if profile == PROFILE_HAYWARD_WIRED_REMOTE:
+        # Verified via live bus capture 2026-05: Hayward AquaLogic frames on the wired bus
+        # all use sum16 header_inclusive (DLE+STX bytes participate in the checksum). The
+        # earlier payload_only default was an unverified guess; switching to
+        # header_inclusive matches the rest of the bus and lets the controller accept our
+        # frames. wired_remote (sub-type 0x03) impersonates an additional wired keypad
+        # registered in the AquaLogic system setup, which avoids colliding with the main
+        # panel's own 0x02 traffic during simultaneous local-keypress + HA-keypress.
         return {
             CONF_KEY_FORMAT: "wired_remote",
-            CONF_TX_VARIANT: "payload_only",
+            CONF_TX_VARIANT: "header_inclusive",
         }
     if profile == PROFILE_HAYWARD_WIRED_LOCAL:
+        # Same CRC story as wired_remote. wired_local (sub-type 0x02) impersonates unit 1
+        # which on a stock install is the main panel itself — convenient if the bus has
+        # no additional wired remote registered, but risks colliding with the main panel's
+        # own keypress traffic. Use `wired_sub_type: 0x03` (or higher) at the hub level
+        # to impersonate a different unit when the main panel is active.
         return {
             CONF_KEY_FORMAT: "wired_local",
-            CONF_TX_VARIANT: "payload_only",
+            CONF_TX_VARIANT: "header_inclusive",
         }
     if profile == PROFILE_JANDY_RS:
         return {
@@ -376,6 +389,16 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_CRC, default={}): CRC_SCHEMA,
             cv.Optional(CONF_TX, default={}): TX_SCHEMA,
             cv.Optional(CONF_KEY_FORMAT): cv.one_of(*KEY_FORMATS, lower=True),
+            # Hayward AquaLogic wired controllers are distinguished on the bus by the
+            # second byte of their frame_type: 0x02 = unit 1 (typically the main panel),
+            # 0x03 = unit 2 (the OEM wired remote), 0x04 = unit 3, etc. The hardware
+            # select pin on each physical keypad picks the value. wired_remote /
+            # wired_local key formats supply sensible defaults (0x03 / 0x02 respectively),
+            # but if your installation has multiple wired units and you want to mimic a
+            # specific one — or avoid colliding with the main panel's own 0x02 traffic —
+            # set this byte explicitly. Only meaningful with key_format wired_local or
+            # wired_remote; ignored for wireless / Jandy formats.
+            cv.Optional(CONF_WIRED_SUB_TYPE): validate_byte,
             cv.Optional(CONF_DUMP_FRAMES, default=False): cv.boolean,
             cv.Optional(CONF_SNIFFER_ONLY, default=False): cv.boolean,
             # Minimum legal RX frame = DLE STX FT0 FT1 DLE ETX = 6 bytes (no CRC).
@@ -478,6 +501,8 @@ async def to_code(config):
         cg.add(var.set_idle_command(idle_cmd))
 
     cg.add(var.set_key_format(KEY_FORMATS[config[CONF_KEY_FORMAT]]))
+    if (sub := config.get(CONF_WIRED_SUB_TYPE)) is not None:
+        cg.add(var.set_wired_sub_type(sub))
     cg.add(var.set_dump_frames(config[CONF_DUMP_FRAMES]))
     cg.add(var.set_sniffer_only(config[CONF_SNIFFER_ONLY]))
     cg.add(var.set_max_frame_length(config[CONF_MAX_FRAME_LENGTH]))
