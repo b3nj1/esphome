@@ -136,6 +136,9 @@ sensor:
     rs485_frame_id: rs485_frame_hub
     name: "Last Keepalive ms"
     decode: last_keepalive_ms
+    # Platform supplies state_class=measurement, unit=ms, device_class=duration. Override
+    # state_class here to confirm explicit values win over the per-decode default.
+    state_class: total
 
   - platform: rs485_frame
     rs485_frame_id: rs485_frame_hub
