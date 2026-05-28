@@ -19,6 +19,13 @@ namespace esphome::rs485_frame {
 // StaticVector template parameters and the Python cv.Length(max=) validator must agree.
 static constexpr size_t MAX_FRAME_TYPE_LEN = 8;
 
+// Maximum number of alternative frame-type prefixes a single on_frame: trigger can match.
+// on_frame.frame_type accepts either a single prefix (e.g. [0x01, 0x03]) or a list of
+// prefixes (e.g. [[0x01, 0x03], [0x01, 0x09]]) so one lambda can decode multiple related
+// frame types. Cap exists to bound the trigger's static storage; the Python schema rejects
+// any list longer than this. Bump both sides together if more alternates are ever needed.
+static constexpr size_t MAX_FRAME_TYPE_ALTS = 4;
+
 // Framing overhead added to every TX frame: DLE+STX(2) + DLE+ETX(2) + escaped CRC max(4).
 static constexpr size_t FRAME_OVERHEAD_BYTES = 8;
 
@@ -76,8 +83,9 @@ enum TxGateMode {
 
 class RS485FrameHub;
 
-/// Automation trigger fired by the hub when a frame matching the configured frame_type
-/// is received. The full decoded payload is passed as the automation argument `payload`.
+/// Automation trigger fired by the hub when a frame matching one of the configured
+/// frame_type prefixes is received. The full decoded payload is passed as the automation
+/// argument `payload`.
 ///
 /// **Offset convention: payload-relative.** `payload[0..N-1]` are the N-byte frame_type
 /// prefix (typically 2 bytes); data starts at `payload[N]`. DLE+STX, escape bytes, and
@@ -88,21 +96,28 @@ class RS485FrameHub;
 /// our `payload[2]`). See the rs485_frame docs' "Offset convention" section for the
 /// translation table when porting offsets from external research.
 ///
-/// The trigger holds its own frame_type prefix (StaticVector to avoid heap allocation)
-/// and is registered with the hub via register_trigger().
+/// A trigger holds up to MAX_FRAME_TYPE_ALTS frame-type prefixes (StaticVector to avoid
+/// heap allocation) and matches if any one of them is a prefix of the payload. An empty
+/// frame_types_ matches every frame (the documented `frame_type: []` form). The trigger
+/// is registered with the hub via register_trigger().
 ///
 /// Note: build_callback_automation() (preferred by CLAUDE.md for stateless triggers)
 /// cannot be used because the trigger must carry its own frame_type filter for the hub
 /// to dispatch against. A full Trigger subclass is justified.
 class RS485FrameTrigger : public Trigger<const std::vector<uint8_t> &> {
  public:
-  void set_frame_type(const std::vector<uint8_t> &frame_type) {
-    this->frame_type_.assign(frame_type.begin(), frame_type.end());
+  // Appends one prefix to this trigger's match list. Called once per prefix from to_code;
+  // the schema rejects more than MAX_FRAME_TYPE_ALTS prefixes, so the StaticVector cap is
+  // never reached at runtime, but push_back silently drops extras as a final safety net.
+  void add_frame_type(const std::vector<uint8_t> &frame_type) {
+    StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> prefix;
+    prefix.assign(frame_type.begin(), frame_type.end());
+    this->frame_types_.push_back(prefix);
   }
   bool matches(const std::vector<uint8_t> &payload) const;
 
  protected:
-  StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> frame_type_;
+  StaticVector<StaticVector<uint8_t, MAX_FRAME_TYPE_LEN>, MAX_FRAME_TYPE_ALTS> frame_types_;
 };
 
 /// Central hub for a DLE-framed RS485 bus. Owns the UART framer, TX queue,

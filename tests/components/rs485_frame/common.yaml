@@ -28,7 +28,13 @@ rs485_frame:
       # Display text decode into a static (BSS-allocated) buffer then a single
       # std::string at publish time. static: allocated once at program start so the
       # lambda inherits the hub's no-heap-after-setup discipline.
-      - frame_type: [0x01, 0x03]
+      #
+      # frame_type accepts the list-of-prefixes form: the same lambda fires for both
+      # display frame types (0x01 0x03 main + 0x01 0x09 secondary) without duplicating
+      # the body. The frame_type bytes remain at payload[0..1] so the decode is identical.
+      - frame_type:
+          - [0x01, 0x03]
+          - [0x01, 0x09]
         then:
           - lambda: |-
               const size_t BUF_LEN = 128;

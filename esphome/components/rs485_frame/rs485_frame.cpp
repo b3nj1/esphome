@@ -58,11 +58,18 @@ static const char *queue_policy_str(QueuePolicy p) {
 }
 
 bool RS485FrameTrigger::matches(const std::vector<uint8_t> &payload) const {
-  if (this->frame_type_.empty())
+  // Empty prefix list = match every frame (documented `frame_type: []` behavior). Any
+  // prefix that is itself empty also matches — kept for backward compatibility with
+  // older codegen paths, though the current to_code skips zero-length prefixes.
+  if (this->frame_types_.empty())
     return true;
-  if (payload.size() < this->frame_type_.size())
-    return false;
-  return std::equal(this->frame_type_.begin(), this->frame_type_.end(), payload.begin());
+  for (const auto &prefix : this->frame_types_) {
+    if (prefix.empty())
+      return true;
+    if (payload.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), payload.begin()))
+      return true;
+  }
+  return false;
 }
 
 void RS485FrameHub::setup() {

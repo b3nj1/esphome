@@ -129,6 +129,35 @@ def validate_frame_type(value):
     return cv.All(cv.ensure_list(validate_byte), cv.Length(max=8))(value)
 
 
+# Schema cap for the number of frame-type alternates per on_frame: entry. Must agree with
+# MAX_FRAME_TYPE_ALTS in rs485_frame.h — the C++ StaticVector silently drops push_back past
+# its cap, so the schema is the only place that surfaces "too many alternates" as an error.
+MAX_FRAME_TYPE_ALTS = 4
+
+
+def validate_frame_type_or_list(value):
+    # on_frame: frame_type accepts either a single prefix ([0x01, 0x03]) or a list of
+    # prefixes ([[0x01, 0x03], [0x01, 0x09]]) so one lambda can decode multiple related
+    # frame types. Disambiguate by inspecting the first element: a list there means the
+    # list-of-prefixes form, anything else (or empty) is the single-prefix form.
+    # Normalize to a list-of-prefixes for code generation; the empty single-prefix form
+    # (`frame_type: []` = match-all) is preserved as an empty prefix list so to_code emits
+    # zero add_frame_type calls and the runtime falls back to its match-all branch.
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        value = [value]
+    if value and isinstance(value[0], list):
+        return cv.All(
+            cv.ensure_list(validate_frame_type),
+            cv.Length(min=1, max=MAX_FRAME_TYPE_ALTS),
+        )(value)
+    single = validate_frame_type(value)
+    if not single:
+        return []
+    return [single]
+
+
 # Internal dict key used by _profile_defaults to carry a profile-specific TX gate frame
 # default into validate_hub. Not a YAML option (the leading underscore signals "private"),
 # and intentionally not named CONF_* because it never appears in a user-facing schema.
@@ -335,7 +364,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ON_FRAME): automation.validate_automation(
                 {
                     cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(RS485FrameTrigger),
-                    cv.Required(CONF_FRAME_TYPE): validate_frame_type,
+                    cv.Required(CONF_FRAME_TYPE): validate_frame_type_or_list,
                 }
             ),
             cv.Optional(CONF_SNIFFER_STATS): SNIFFER_STATS_SCHEMA,
@@ -432,7 +461,11 @@ async def to_code(config):
 
     for conf in config.get(CONF_ON_FRAME, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
-        cg.add(trigger.set_frame_type(conf[CONF_FRAME_TYPE]))
+        # validate_frame_type_or_list normalizes the YAML to a list-of-prefixes; empty
+        # list = match-all, in which case we emit zero add_frame_type calls and the
+        # trigger's matches() falls through to its empty-list branch.
+        for prefix in conf[CONF_FRAME_TYPE]:
+            cg.add(trigger.add_frame_type(prefix))
         cg.add(var.register_trigger(trigger))
         await automation.build_automation(
             trigger,
