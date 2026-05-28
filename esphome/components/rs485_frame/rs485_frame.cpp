@@ -606,7 +606,13 @@ void RS485FrameHub::update_last_frame_type_() {
 }
 
 #ifdef USE_BUTTON
-void RS485FrameButton::press_action() { this->parent_->queue_command_value(this->command_value_); }
+void RS485FrameButton::press_action() {
+  if (this->raw_mode_) {
+    this->parent_->queue_raw_frame(this->raw_frame_);
+  } else {
+    this->parent_->queue_command_value(this->command_value_);
+  }
+}
 #endif  // USE_BUTTON
 
 #ifdef USE_NUMBER

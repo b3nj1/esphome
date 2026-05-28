@@ -9,6 +9,7 @@ from esphome.const import (
     CONF_ID,
     CONF_INTERVAL,
     CONF_MODE,
+    CONF_PAYLOAD,
     CONF_TRIGGER_ID,
     CONF_TYPE,
     CONF_UART_ID,
@@ -28,6 +29,7 @@ RS485FrameTrigger = rs485_frame_ns.class_(
         cg.std_vector.template(cg.uint8).operator("const").operator("ref")
     ),
 )
+SendFrameAction = rs485_frame_ns.class_("SendFrameAction", automation.Action)
 
 SensorDecode = rs485_frame_ns.enum("SensorDecode")
 KeyFormat = rs485_frame_ns.enum("KeyFormat")
@@ -200,10 +202,19 @@ def _profile_defaults(profile):
             # 0x08..0x0B; a user with a different address must override this explicitly.
             _PROFILE_GATE_FRAME_TYPE: [0x08, 0x00],
         }
-    return {
-        CONF_KEY_FORMAT: "wireless_12byte",
-        CONF_TX_VARIANT: "header_inclusive",
-    }
+    if profile == PROFILE_HAYWARD_WIRELESS:
+        return {
+            CONF_KEY_FORMAT: "wireless_12byte",
+            CONF_TX_VARIANT: "header_inclusive",
+        }
+    # PROFILE_GENERIC: no key_format default. The `command:` form on the button platform
+    # uses the hub's key_format, so omitting it here forces generic users onto the raw
+    # `frame_type` + `payload` form (or to set key_format: explicitly if they want to
+    # piggyback on one of the built-in encoders). The C++ side keeps a placeholder
+    # default for key_format_ but it is unreachable as long as set_key_format() is not
+    # called, since the button platform's _final_validate rejects `command:` against a
+    # generic hub with no key_format.
+    return {CONF_TX_VARIANT: "header_inclusive"}
 
 
 FRAMING_SCHEMA = cv.Schema(
@@ -322,7 +333,7 @@ def validate_hub(config):
     profile = config[CONF_PROFILE]
     defaults = _profile_defaults(profile)
 
-    if CONF_KEY_FORMAT not in config:
+    if CONF_KEY_FORMAT not in config and CONF_KEY_FORMAT in defaults:
         config[CONF_KEY_FORMAT] = defaults[CONF_KEY_FORMAT]
 
     if CONF_TX_VARIANT not in config[CONF_CRC]:
@@ -500,13 +511,34 @@ async def to_code(config):
     if (idle_cmd := tx.get(CONF_IDLE_COMMAND)) is not None:
         cg.add(var.set_idle_command(idle_cmd))
 
-    cg.add(var.set_key_format(KEY_FORMATS[config[CONF_KEY_FORMAT]]))
+    # key_format is only present when the profile supplies a default or the user set it
+    # explicitly. profile: generic_rs485_frame deliberately leaves it unset so the C++
+    # placeholder default (KEY_FORMAT_WIRELESS_12BYTE) is never reached — see the button
+    # platform's _final_validate, which rejects `command:` against such a hub.
+    if (kf := config.get(CONF_KEY_FORMAT)) is not None:
+        cg.add(var.set_key_format(KEY_FORMATS[kf]))
     if (sub := config.get(CONF_WIRED_SUB_TYPE)) is not None:
         cg.add(var.set_wired_sub_type(sub))
     cg.add(var.set_dump_frames(config[CONF_DUMP_FRAMES]))
     cg.add(var.set_sniffer_only(config[CONF_SNIFFER_ONLY]))
     cg.add(var.set_max_frame_length(config[CONF_MAX_FRAME_LENGTH]))
     cg.add(var.set_in_frame_timeout(config[CONF_FRAME_TIMEOUT].total_milliseconds))
+
+    if (stats := config.get(CONF_SNIFFER_STATS)) is not None:
+        # cg.add_define gates the SnifferStats field, includes, and hot-path call out of
+        # builds that don't use sniffer_stats — production firmware pays no cost at all.
+        cg.add_define("USE_RS485_FRAME_SNIFFER_STATS")
+        ref = stats.get(CONF_REFERENCE_FRAME_TYPE, gate[CONF_FRAME_TYPE])
+        cg.add(
+            var.enable_sniffer_stats(
+                stats[CONF_MAX_FRAME_TYPES],
+                stats[CONF_INTERVAL].total_milliseconds,
+                stats[CONF_PAYLOAD_DUMP_TOP],
+                stats[CONF_MAX_UNIQUE_PAYLOADS],
+                stats[CONF_PAYLOAD_CAPTURE_BYTES],
+                ref,
+            )
+        )
 
     for conf in config.get(CONF_ON_FRAME, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
@@ -527,18 +559,36 @@ async def to_code(config):
             conf,
         )
 
-    if (stats := config.get(CONF_SNIFFER_STATS)) is not None:
-        # cg.add_define gates the SnifferStats field, includes, and hot-path call out of
-        # builds that don't use sniffer_stats — production firmware pays no cost at all.
-        cg.add_define("USE_RS485_FRAME_SNIFFER_STATS")
-        ref = stats.get(CONF_REFERENCE_FRAME_TYPE, gate[CONF_FRAME_TYPE])
-        cg.add(
-            var.enable_sniffer_stats(
-                stats[CONF_MAX_FRAME_TYPES],
-                stats[CONF_INTERVAL].total_milliseconds,
-                stats[CONF_PAYLOAD_DUMP_TOP],
-                stats[CONF_MAX_UNIQUE_PAYLOADS],
-                stats[CONF_PAYLOAD_CAPTURE_BYTES],
-                ref,
-            )
-        )
+
+# rs485_frame.send_frame: queue an arbitrary frame for transmission. Both frame_type
+# and payload are templatable lists of bytes so callers can compute them at action time
+# (e.g. from a trigger's payload, a global, or a sensor reading). The hub takes care of
+# DLE-framing, byte-stuffing, and CRC according to the hub's crc.type and crc.tx_variant.
+# This is the primary transmit path for generic_rs485_frame (no key_format machinery
+# involved) and a flexible escape hatch for Hayward/Jandy profiles that need to send
+# something the built-in key formats don't cover (probe frames, vendor-specific commands,
+# device-discovery sequences, etc.).
+SEND_FRAME_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.use_id(RS485FrameHub),
+        cv.Required(CONF_FRAME_TYPE): cv.templatable(validate_frame_type),
+        cv.Required(CONF_PAYLOAD): cv.templatable(cv.ensure_list(validate_byte)),
+    }
+)
+
+
+@automation.register_action(
+    "rs485_frame.send_frame", SendFrameAction, SEND_FRAME_SCHEMA, synchronous=True
+)
+async def send_frame_action_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    frame_type = await cg.templatable(
+        config[CONF_FRAME_TYPE], args, cg.std_vector.template(cg.uint8)
+    )
+    cg.add(var.set_frame_type(frame_type))
+    payload = await cg.templatable(
+        config[CONF_PAYLOAD], args, cg.std_vector.template(cg.uint8)
+    )
+    cg.add(var.set_payload(payload))
+    return var

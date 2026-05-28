@@ -68,6 +68,8 @@ rs485_frame:
   # Generic profile bypasses final_validate UART enforcement so 38400 7E1 is accepted.
   # Also exercises sniffer_stats: without an explicit reference_frame_type to confirm the
   # default-to-gate fallback in to_code is reached during config-only validation.
+  # No key_format set: validates that generic hubs omit key_format from defaults (so the
+  # button platform's final_validate can detect "command: against a generic hub" cleanly).
   - id: generic_hub
     uart_id: generic_uart
     profile: generic_rs485_frame
@@ -77,3 +79,37 @@ rs485_frame:
       gate:
         mode: idle_gap
     sniffer_stats: {}
+
+  # Generic profile with an explicit key_format: validates that command:-form buttons are
+  # still accepted against generic hubs when the user opts in by setting key_format.
+  - id: generic_hub_with_key_format
+    uart_id: generic_uart
+    profile: generic_rs485_frame
+    key_format: jandy_allbutton
+    crc:
+      type: sum8
+    tx:
+      gate:
+        mode: idle_gap
+
+# Buttons exercise the new mutually-exclusive command vs frame_type+payload validation.
+# All branches of _validate_button + _final_validate are reached:
+#   - command-form against a profile that supplies key_format (hayward_wireless_hub)
+#   - raw form against a generic hub with no key_format (generic_hub)
+#   - command-form against a generic hub with explicit key_format (generic_hub_with_key_format)
+button:
+  - platform: rs485_frame
+    rs485_frame_id: hayward_wireless_hub
+    name: "Validate Lights"
+    command: 0x00010000
+
+  - platform: rs485_frame
+    rs485_frame_id: generic_hub
+    name: "Validate Raw"
+    frame_type: [0x00, 0xA1]
+    payload: [0x01, 0x02, 0x03, 0x04]
+
+  - platform: rs485_frame
+    rs485_frame_id: generic_hub_with_key_format
+    name: "Validate Command Override"
+    command: 0x00000001
