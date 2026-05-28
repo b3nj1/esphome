@@ -22,7 +22,7 @@ static constexpr size_t SNIFFER_PAYLOAD_CAPTURE_BYTES = 16;
 
 // Number of distinct payloads remembered per frame_type. Additional unique payloads beyond
 // this cap are counted in unique_overflow without being stored.
-static constexpr size_t SNIFFER_MAX_UNIQUE_PAYLOADS = 4;
+static constexpr size_t SNIFFER_MAX_UNIQUE_PAYLOADS = 8;
 
 // Ring-buffer length of recent inter-arrival samples per frame_type. Median is computed
 // from this window at dump time; min/max are tracked exactly across the whole period.
@@ -62,6 +62,7 @@ struct DelayStats {
 struct PayloadCapture {
   uint8_t bytes[SNIFFER_PAYLOAD_CAPTURE_BYTES]{};
   uint8_t len{0};
+  uint8_t count{0};
 };
 
 // Per-frame-type accumulator. Frame types are keyed by the first 2 bytes of the payload

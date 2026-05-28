@@ -95,12 +95,15 @@ SnifferEntry *SnifferStats::find_or_create_(const uint8_t *frame_type) {
 void SnifferStats::update_unique_payload_(SnifferEntry &e, const std::vector<uint8_t> &payload) {
   size_t len = payload.size() < SNIFFER_PAYLOAD_CAPTURE_BYTES ? payload.size() : SNIFFER_PAYLOAD_CAPTURE_BYTES;
   for (uint8_t i = 0; i < e.unique_count; i++) {
-    if (e.payloads[i].len == len && std::memcmp(e.payloads[i].bytes, payload.data(), len) == 0)
+    if (e.payloads[i].len == len && std::memcmp(e.payloads[i].bytes, payload.data(), len) == 0) {
+      e.payloads[i].count++;
       return;
+    }
   }
   if (e.unique_count < SNIFFER_MAX_UNIQUE_PAYLOADS) {
     std::memcpy(e.payloads[e.unique_count].bytes, payload.data(), len);
     e.payloads[e.unique_count].len = static_cast<uint8_t>(len);
+    e.payloads[e.unique_count].count = 0;
     e.unique_count++;
   } else if (e.unique_overflow < UINT16_MAX) {
     e.unique_overflow++;
@@ -253,7 +256,7 @@ void SnifferStats::dump_payloads_(size_t top_n, const uint8_t *order) const {
         ascii_buf[b] = (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '.';
       }
       ascii_buf[p.len] = '\0';
-      ESP_LOGI(TAG, "    %s |%s|", hex_buf, ascii_buf);
+      ESP_LOGI(TAG, "    %5d @ %s |%s|", p.count, hex_buf, ascii_buf);
     }
   }
 }
