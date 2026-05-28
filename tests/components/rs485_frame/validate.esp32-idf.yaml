@@ -33,26 +33,32 @@ uart:
     stop_bits: 1
 
 rs485_frame:
-  # Hayward wireless — default key_format wireless_12byte, gate [0x01, 0x01].
+  # Hayward wireless — profile injects command_format with preamble [0x00, 0x83, 0x01],
+  # 4-byte command × 2, trailing pad 0x00. Gate [0x01, 0x01].
   - id: hayward_wireless_hub
     uart_id: hayward_uart
     profile: hayward_aqualogic_wireless
 
-  # Hayward wired remote — header_inclusive CRC, key_format wired_remote, sub-type 0x03.
+  # Hayward wired remote — profile injects command_format preamble [0x00, 0x03].
   - id: hayward_wired_remote_hub
     uart_id: hayward_uart
     profile: hayward_aqualogic_wired_remote
 
-  # Hayward wired local — header_inclusive CRC, key_format wired_local, sub-type 0x02.
-  # Exercises the wired_sub_type override too: impersonate unit 3 (0x04) to avoid the
-  # default-0x02 collision with main-panel keypress traffic.
+  # Hayward wired local — profile injects command_format preamble [0x00, 0x02].
+  # Exercises explicit command_format override: impersonate unit 3 (0x04) instead of the
+  # profile default 0x02 to avoid colliding with main-panel keypress traffic.
+  # With command_format: the user just writes the preamble bytes they want — no separate
+  # wired_sub_type knob required.
   - id: hayward_wired_local_hub
     uart_id: hayward_uart
     profile: hayward_aqualogic_wired_local
-    wired_sub_type: 0x04
+    command_format:
+      preamble: [0x00, 0x04]
+      command_size: 4
+      command_repeat: 2
 
-  # Jandy AllButton emulator — profile injects gate frame [0x08, 0x00] (AllButton probe)
-  # and sum8 header-inclusive CRC. Requires idle_command (enforced by validate_hub).
+  # Jandy AllButton emulator — profile injects gate frame [0x08, 0x00] (AllButton probe),
+  # sum8 header-inclusive CRC, and command_format with 1-byte command. Requires idle_command.
   - id: jandy_hub
     uart_id: jandy_uart
     profile: jandy_aqualink_rs
@@ -68,8 +74,8 @@ rs485_frame:
   # Generic profile bypasses final_validate UART enforcement so 38400 7E1 is accepted.
   # Also exercises sniffer_stats: without an explicit reference_frame_type to confirm the
   # default-to-gate fallback in to_code is reached during config-only validation.
-  # No key_format set: validates that generic hubs omit key_format from defaults (so the
-  # button platform's final_validate can detect "command: against a generic hub" cleanly).
+  # No command_format set: validates that generic hubs omit it from defaults (so the button
+  # platform's _final_validate can detect "command: against a hub with no command_format").
   - id: generic_hub
     uart_id: generic_uart
     profile: generic_rs485_frame
@@ -80,23 +86,26 @@ rs485_frame:
         mode: idle_gap
     sniffer_stats: {}
 
-  # Generic profile with an explicit key_format: validates that command:-form buttons are
-  # still accepted against generic hubs when the user opts in by setting key_format.
-  - id: generic_hub_with_key_format
+  # Generic profile with an explicit command_format: validates that command:-form buttons
+  # are accepted against generic hubs when the user opts in by adding command_format:.
+  # Uses the Jandy AllButton encoding as a representative 1-byte command example.
+  - id: generic_hub_with_command_format
     uart_id: generic_uart
     profile: generic_rs485_frame
-    key_format: jandy_allbutton
+    command_format:
+      preamble: [0x00, 0x01, 0x80]
+      command_size: 1
     crc:
       type: sum8
     tx:
       gate:
         mode: idle_gap
 
-# Buttons exercise the new mutually-exclusive command vs frame_type+payload validation.
+# Buttons exercise the mutually-exclusive command vs frame_type+payload validation.
 # All branches of _validate_button + _final_validate are reached:
-#   - command-form against a profile that supplies key_format (hayward_wireless_hub)
-#   - raw form against a generic hub with no key_format (generic_hub)
-#   - command-form against a generic hub with explicit key_format (generic_hub_with_key_format)
+#   - command-form against a profile that supplies command_format (hayward_wireless_hub)
+#   - raw form against a generic hub with no command_format (generic_hub)
+#   - command-form against a generic hub with explicit command_format (generic_hub_with_command_format)
 button:
   - platform: rs485_frame
     rs485_frame_id: hayward_wireless_hub
@@ -110,6 +119,6 @@ button:
     payload: [0x01, 0x02, 0x03, 0x04]
 
   - platform: rs485_frame
-    rs485_frame_id: generic_hub_with_key_format
+    rs485_frame_id: generic_hub_with_command_format
     name: "Validate Command Override"
     command: 0x00000001

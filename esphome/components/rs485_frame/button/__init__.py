@@ -5,11 +5,9 @@ from esphome.const import CONF_COMMAND, CONF_PAYLOAD
 import esphome.final_validate as fv
 
 from .. import (
+    CONF_COMMAND_FORMAT,
     CONF_FRAME_TYPE,
-    CONF_KEY_FORMAT,
-    CONF_PROFILE,
     CONF_RS485_FRAME_ID,
-    PROFILE_GENERIC,
     RS485FrameHub,
     rs485_frame_ns,
     validate_byte,
@@ -60,26 +58,22 @@ CONFIG_SCHEMA = cv.All(
 
 
 def _final_validate(config):
-    # The `command:` form is only meaningful when the hub has a key_format. Every named
-    # profile (hayward_*, jandy_*) supplies a key_format via _profile_defaults; only
-    # generic_rs485_frame leaves it unset (it inherits wireless_12byte as an unrelated
-    # placeholder default). Reject `command:` against a generic hub at config time so
-    # users see a clear error instead of silently emitting a 12-byte Hayward wireless
-    # frame from a hub that has nothing to do with Hayward wireless.
+    # The `command:` form is only meaningful when the hub has a command_format. Every named
+    # profile (hayward_*, jandy_*) supplies one via _profile_defaults; generic_rs485_frame
+    # leaves it unset unless the user adds it explicitly. Reject `command:` against a hub
+    # with no command_format so users see a clear error instead of silently doing nothing.
     if CONF_COMMAND not in config:
         return config
 
     full_config = fv.full_config.get()
     hub_path = full_config.get_path_for_id(config[CONF_RS485_FRAME_ID])[:-1]
     hub_config = full_config.get_config_for_path(hub_path)
-    if (
-        hub_config.get(CONF_PROFILE) == PROFILE_GENERIC
-        and CONF_KEY_FORMAT not in hub_config
-    ):
+    if CONF_COMMAND_FORMAT not in hub_config:
         raise cv.Invalid(
-            f"rs485_frame button 'command' requires the hub to have a 'key_format' set. "
-            f"profile: {PROFILE_GENERIC} hubs have no built-in key_format — use the raw "
-            f"'frame_type' + 'payload' form, or set 'key_format' explicitly on the hub."
+            "rs485_frame button 'command' requires the hub to have a 'command_format' set. "
+            "Named profiles (hayward_*, jandy_*) include one automatically. For "
+            "generic_rs485_frame hubs, add a 'command_format:' block to the hub, or use "
+            "the raw 'frame_type' + 'payload' form instead."
         )
     return config
 

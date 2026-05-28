@@ -29,10 +29,10 @@ static constexpr size_t MAX_FRAME_TYPE_ALTS = 4;
 // Framing overhead added to every TX frame: DLE+STX(2) + DLE+ETX(2) + escaped CRC max(4).
 static constexpr size_t FRAME_OVERHEAD_BYTES = 8;
 
-// Maximum payload bytes built by build_key_payload_(). The current widest case is the
-// 12-byte Hayward wireless format (3-byte header + 4-byte key × 2 + 1 pad). A small
-// constant buys room for future key formats without re-tuning the buffer reserve.
-static constexpr size_t MAX_KEY_PAYLOAD_LEN = 16;
+// Maximum preamble / postamble byte-list lengths for command_format. Must agree with the
+// Python schema caps (cv.Length(max=8)) so the StaticVectors are never over-filled.
+static constexpr size_t MAX_COMMAND_PREAMBLE_LEN = 8;
+static constexpr size_t MAX_COMMAND_POSTAMBLE_LEN = 8;
 
 /// Diagnostic value exposed by the rs485_frame sensor/text_sensor platforms.
 /// These are hub state, not user payload decoding — user decoding is done via on_frame:.
@@ -43,14 +43,6 @@ enum SensorDecode {
   SENSOR_DECODE_COMMAND_DROPS,      ///< Commands dropped (queue full or sniffer mode).
   SENSOR_DECODE_LAST_KEEPALIVE_MS,  ///< Interval (ms) between the last two gate frames.
   SENSOR_DECODE_QUEUE_DEPTH,        ///< Current TX queue depth.
-};
-
-/// Key-frame format used when encoding button commands for TX.
-enum KeyFormat {
-  KEY_FORMAT_WIRELESS_12BYTE,  ///< Hayward AquaLogic wireless remote (frame type 0x0083, 12-byte payload).
-  KEY_FORMAT_WIRED_REMOTE,     ///< Hayward AquaLogic wired remote.
-  KEY_FORMAT_WIRED_LOCAL,      ///< Hayward AquaLogic local wired controller.
-  KEY_FORMAT_JANDY_ALLBUTTON,  ///< Jandy AquaLink RS AllButton frame.
 };
 
 /// Which bytes are included in the CRC calculation.
@@ -145,15 +137,18 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   void set_tx_fixed_interval(uint32_t interval) { this->tx_fixed_interval_ = interval; }
   void set_queue_policy(QueuePolicy policy) { this->queue_policy_ = policy; }
   void set_max_queue_size(uint32_t size) { this->max_queue_size_ = size; }
-  void set_key_format(KeyFormat format) { this->key_format_ = format; }
-  // Override the wired-controller sub-type byte (second byte of the wired frame_type).
-  // Only used when key_format is wired_local or wired_remote; ignored otherwise. Lets
-  // users impersonate any wired unit-address (typically 0x02..0x04 for Hayward) without
-  // editing C++ — useful both for matching a specific installation's hardware-select
-  // wiring and for avoiding collisions with the main panel's own keypress traffic.
-  void set_wired_sub_type(uint8_t b) {
-    this->wired_sub_type_override_ = b;
-    this->has_wired_sub_type_override_ = true;
+  // Configure the generic command encoder. Preamble bytes are written first, then the
+  // 32-bit command value serialised as command_size bytes (1/2/4) in the requested byte
+  // order, repeated command_repeat times, then the postamble bytes. All four legacy
+  // Hayward/Jandy formats are expressible as data via this interface.
+  void set_command_format(const std::vector<uint8_t> &preamble, uint8_t command_size, bool big_endian, uint8_t repeat,
+                          const std::vector<uint8_t> &postamble) {
+    this->cmd_preamble_.assign(preamble.begin(), preamble.end());
+    this->cmd_postamble_.assign(postamble.begin(), postamble.end());
+    this->cmd_command_size_ = command_size;
+    this->cmd_big_endian_ = big_endian;
+    this->cmd_repeat_ = repeat;
+    this->has_command_format_ = true;
   }
   void set_idle_command(uint32_t cmd) {
     this->idle_command_ = cmd;
@@ -226,12 +221,15 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   uint32_t tx_fixed_interval_{100};
   QueuePolicy queue_policy_{QUEUE_REPLACE_LATEST};
   uint32_t max_queue_size_{1};
-  KeyFormat key_format_{KEY_FORMAT_WIRELESS_12BYTE};
-  // wired_sub_type override. has_wired_sub_type_override_ stays false unless the user
-  // set the YAML option, in which case build_key_payload_ uses wired_sub_type_override_
-  // in place of the key_format-derived default (0x02 or 0x03).
-  uint8_t wired_sub_type_override_{0};
-  bool has_wired_sub_type_override_{false};
+  // Generic command encoder. Has_command_format_ is false for hubs without command_format:
+  // (generic_rs485_frame with no explicit block). build_key_payload_ is never called in
+  // that case — the button platform's _final_validate rejects `command:` against such hubs.
+  StaticVector<uint8_t, MAX_COMMAND_PREAMBLE_LEN> cmd_preamble_;
+  StaticVector<uint8_t, MAX_COMMAND_POSTAMBLE_LEN> cmd_postamble_;
+  uint8_t cmd_command_size_{4};
+  bool cmd_big_endian_{true};
+  uint8_t cmd_repeat_{1};
+  bool has_command_format_{false};
   uint32_t idle_command_{0};
   bool has_idle_command_{false};
   bool dump_frames_{false};

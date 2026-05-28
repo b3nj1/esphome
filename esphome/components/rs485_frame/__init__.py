@@ -32,13 +32,16 @@ RS485FrameTrigger = rs485_frame_ns.class_(
 SendFrameAction = rs485_frame_ns.class_("SendFrameAction", automation.Action)
 
 SensorDecode = rs485_frame_ns.enum("SensorDecode")
-KeyFormat = rs485_frame_ns.enum("KeyFormat")
 CrcVariant = rs485_frame_ns.enum("CrcVariant")
 CrcType = rs485_frame_ns.enum("CrcType")
 QueuePolicy = rs485_frame_ns.enum("QueuePolicy")
 TxGateMode = rs485_frame_ns.enum("TxGateMode")
 
 CONF_RS485_FRAME_ID = "rs485_frame_id"
+CONF_COMMAND_ENDIAN = "command_endian"
+CONF_COMMAND_FORMAT = "command_format"
+CONF_COMMAND_REPEAT = "command_repeat"
+CONF_COMMAND_SIZE = "command_size"
 CONF_CRC = "crc"
 CONF_DECODE = "decode"
 CONF_DLE = "dle"
@@ -49,7 +52,6 @@ CONF_FRAME_TIMEOUT = "frame_timeout"
 CONF_FRAME_TYPE = "frame_type"
 CONF_FRAMING = "framing"
 CONF_GATE = "gate"
-CONF_KEY_FORMAT = "key_format"
 CONF_MAX_FRAME_LENGTH = "max_frame_length"
 CONF_MAX_FRAME_TYPES = "max_frame_types"
 CONF_MAX_QUEUE_SIZE = "max_queue_size"
@@ -57,6 +59,8 @@ CONF_MAX_UNIQUE_PAYLOADS = "max_unique_payloads"
 CONF_MIN_SILENCE = "min_silence"
 CONF_PAYLOAD_CAPTURE_BYTES = "payload_capture_bytes"
 CONF_PAYLOAD_DUMP_TOP = "payload_dump_top"
+CONF_POSTAMBLE = "postamble"
+CONF_PREAMBLE = "preamble"
 CONF_PROFILE = "profile"
 CONF_QUEUE_POLICY = "queue_policy"
 CONF_REFERENCE_FRAME_TYPE = "reference_frame_type"
@@ -68,20 +72,12 @@ CONF_ON_FRAME = "on_frame"
 CONF_IDLE_COMMAND = "idle_command"
 CONF_TX = "tx"
 CONF_TX_VARIANT = "tx_variant"
-CONF_WIRED_SUB_TYPE = "wired_sub_type"
 
 PROFILE_HAYWARD_WIRELESS = "hayward_aqualogic_wireless"
 PROFILE_HAYWARD_WIRED_REMOTE = "hayward_aqualogic_wired_remote"
 PROFILE_HAYWARD_WIRED_LOCAL = "hayward_aqualogic_wired_local"
 PROFILE_JANDY_RS = "jandy_aqualink_rs"
 PROFILE_GENERIC = "generic_rs485_frame"
-
-KEY_FORMATS = {
-    "wireless_12byte": KeyFormat.KEY_FORMAT_WIRELESS_12BYTE,
-    "wired_remote": KeyFormat.KEY_FORMAT_WIRED_REMOTE,
-    "wired_local": KeyFormat.KEY_FORMAT_WIRED_LOCAL,
-    "jandy_allbutton": KeyFormat.KEY_FORMAT_JANDY_ALLBUTTON,
-}
 
 CRC_VARIANTS = {
     "header_inclusive": CrcVariant.CRC_HEADER_INCLUSIVE,
@@ -116,6 +112,12 @@ SENSOR_DECODES = {
     "last_keepalive_ms": SensorDecode.SENSOR_DECODE_LAST_KEEPALIVE_MS,
     "queue_depth": SensorDecode.SENSOR_DECODE_QUEUE_DEPTH,
 }
+
+
+# Schema caps for preamble / postamble byte lists. Must agree with the C++ StaticVector
+# template arguments MAX_COMMAND_PREAMBLE_LEN / MAX_COMMAND_POSTAMBLE_LEN in rs485_frame.h.
+MAX_COMMAND_PREAMBLE_LEN = 8
+MAX_COMMAND_POSTAMBLE_LEN = 8
 
 
 def validate_byte(value):
@@ -163,6 +165,32 @@ def validate_frame_type_or_list(value):
     return [single]
 
 
+def _validate_command_format_bytes(max_len: int):
+    return cv.All(cv.ensure_list(validate_byte), cv.Length(max=max_len))
+
+
+# Schema for command_format: — defines how a uint32 `command:` value is serialised into
+# the frame payload. Replaces the old key_format: enum + wired_sub_type: knob with a
+# single data-driven block that can express any current or future protocol variant without
+# touching C++. Named profiles supply a command_format: default; generic_rs485_frame hubs
+# omit it (the button platform's _final_validate rejects `command:` against such hubs).
+COMMAND_FORMAT_SCHEMA = cv.Schema(
+    {
+        cv.Optional(CONF_PREAMBLE, default=[]): _validate_command_format_bytes(
+            MAX_COMMAND_PREAMBLE_LEN
+        ),
+        cv.Required(CONF_COMMAND_SIZE): cv.one_of(1, 2, 4, int=True),
+        cv.Optional(CONF_COMMAND_ENDIAN, default="big"): cv.one_of(
+            "big", "little", lower=True
+        ),
+        cv.Optional(CONF_COMMAND_REPEAT, default=1): cv.int_range(min=1, max=4),
+        cv.Optional(CONF_POSTAMBLE, default=[]): _validate_command_format_bytes(
+            MAX_COMMAND_POSTAMBLE_LEN
+        ),
+    }
+)
+
+
 # Internal dict key used by _profile_defaults to carry a profile-specific TX gate frame
 # default into validate_hub. Not a YAML option (the leading underscore signals "private"),
 # and intentionally not named CONF_* because it never appears in a user-facing schema.
@@ -172,29 +200,50 @@ _PROFILE_GATE_FRAME_TYPE = "_gate_frame_type"
 def _profile_defaults(profile):
     if profile == PROFILE_HAYWARD_WIRED_REMOTE:
         # Verified via live bus capture 2026-05: Hayward AquaLogic frames on the wired bus
-        # all use sum16 header_inclusive (DLE+STX bytes participate in the checksum). The
-        # earlier payload_only default was an unverified guess; switching to
-        # header_inclusive matches the rest of the bus and lets the controller accept our
-        # frames. wired_remote (sub-type 0x03) impersonates an additional wired keypad
-        # registered in the AquaLogic system setup, which avoids colliding with the main
+        # all use sum16 header_inclusive (DLE+STX bytes participate in the checksum).
+        # Sub-type 0x03 = "additional wired keypad" — avoids colliding with the main
         # panel's own 0x02 traffic during simultaneous local-keypress + HA-keypress.
+        # To impersonate a different unit-address, set command_format.preamble explicitly
+        # (e.g. preamble: [0x00, 0x04] for unit 3) — no separate knob needed.
         return {
-            CONF_KEY_FORMAT: "wired_remote",
+            CONF_COMMAND_FORMAT: {
+                CONF_PREAMBLE: [HexInt(0x00), HexInt(0x03)],
+                CONF_COMMAND_SIZE: 4,
+                CONF_COMMAND_ENDIAN: "big",
+                CONF_COMMAND_REPEAT: 2,
+                CONF_POSTAMBLE: [],
+            },
             CONF_TX_VARIANT: "header_inclusive",
         }
     if profile == PROFILE_HAYWARD_WIRED_LOCAL:
-        # Same CRC story as wired_remote. wired_local (sub-type 0x02) impersonates unit 1
-        # which on a stock install is the main panel itself — convenient if the bus has
-        # no additional wired remote registered, but risks colliding with the main panel's
-        # own keypress traffic. Use `wired_sub_type: 0x03` (or higher) at the hub level
-        # to impersonate a different unit when the main panel is active.
+        # Same CRC story as wired_remote. Sub-type 0x02 impersonates unit 1 (main panel);
+        # risks collision with the panel's own keypress traffic on a live installation.
+        # Override preamble: [0x00, 0x03] (or higher) to impersonate a different unit.
         return {
-            CONF_KEY_FORMAT: "wired_local",
+            CONF_COMMAND_FORMAT: {
+                CONF_PREAMBLE: [HexInt(0x00), HexInt(0x02)],
+                CONF_COMMAND_SIZE: 4,
+                CONF_COMMAND_ENDIAN: "big",
+                CONF_COMMAND_REPEAT: 2,
+                CONF_POSTAMBLE: [],
+            },
             CONF_TX_VARIANT: "header_inclusive",
         }
     if profile == PROFILE_JANDY_RS:
+        # Jandy AquaLink RS AllButton ACK. Protocol envelope: DLE STX <data> <sum8> DLE ETX.
+        # Third preamble byte 0x80 is community-reverse-engineered; if your master rejects
+        # responses, capture a known-good frame and adjust preamble: accordingly.
+        # References:
+        #   https://wiki.jmehan.com/display/KNOW/Jandy+Pool+Heater
+        #   https://github.com/earlephilhower/aquaweb/blob/master/protocol.md
         return {
-            CONF_KEY_FORMAT: "jandy_allbutton",
+            CONF_COMMAND_FORMAT: {
+                CONF_PREAMBLE: [HexInt(0x00), HexInt(0x01), HexInt(0x80)],
+                CONF_COMMAND_SIZE: 1,
+                CONF_COMMAND_ENDIAN: "big",
+                CONF_COMMAND_REPEAT: 1,
+                CONF_POSTAMBLE: [],
+            },
             CONF_TX_VARIANT: "header_inclusive",
             CONF_TYPE: "sum8",
             CONF_RX_ACCEPT: ["header_inclusive"],
@@ -203,17 +252,23 @@ def _profile_defaults(profile):
             _PROFILE_GATE_FRAME_TYPE: [0x08, 0x00],
         }
     if profile == PROFILE_HAYWARD_WIRELESS:
+        # Hayward wireless remote: 3-byte header + 4-byte key × 2 + 1 pad = 12-byte payload.
+        # Source: https://github.com/swilson/aqualogic (bus captures, wireless remote protocol).
         return {
-            CONF_KEY_FORMAT: "wireless_12byte",
+            CONF_COMMAND_FORMAT: {
+                CONF_PREAMBLE: [HexInt(0x00), HexInt(0x83), HexInt(0x01)],
+                CONF_COMMAND_SIZE: 4,
+                CONF_COMMAND_ENDIAN: "big",
+                CONF_COMMAND_REPEAT: 2,
+                CONF_POSTAMBLE: [HexInt(0x00)],
+            },
             CONF_TX_VARIANT: "header_inclusive",
         }
-    # PROFILE_GENERIC: no key_format default. The `command:` form on the button platform
-    # uses the hub's key_format, so omitting it here forces generic users onto the raw
-    # `frame_type` + `payload` form (or to set key_format: explicitly if they want to
-    # piggyback on one of the built-in encoders). The C++ side keeps a placeholder
-    # default for key_format_ but it is unreachable as long as set_key_format() is not
-    # called, since the button platform's _final_validate rejects `command:` against a
-    # generic hub with no key_format.
+    # PROFILE_GENERIC: no command_format default. The `command:` form on the button platform
+    # requires a command_format on the hub; omitting it here forces generic users onto the
+    # raw `frame_type` + `payload` form, or to set command_format: explicitly if they want
+    # the encoder. The button platform's _final_validate rejects `command:` against a
+    # generic hub that has no command_format.
     return {CONF_TX_VARIANT: "header_inclusive"}
 
 
@@ -333,8 +388,8 @@ def validate_hub(config):
     profile = config[CONF_PROFILE]
     defaults = _profile_defaults(profile)
 
-    if CONF_KEY_FORMAT not in config and CONF_KEY_FORMAT in defaults:
-        config[CONF_KEY_FORMAT] = defaults[CONF_KEY_FORMAT]
+    if CONF_COMMAND_FORMAT not in config and CONF_COMMAND_FORMAT in defaults:
+        config[CONF_COMMAND_FORMAT] = defaults[CONF_COMMAND_FORMAT]
 
     if CONF_TX_VARIANT not in config[CONF_CRC]:
         config[CONF_CRC][CONF_TX_VARIANT] = defaults[CONF_TX_VARIANT]
@@ -399,17 +454,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_FRAMING, default={}): FRAMING_SCHEMA,
             cv.Optional(CONF_CRC, default={}): CRC_SCHEMA,
             cv.Optional(CONF_TX, default={}): TX_SCHEMA,
-            cv.Optional(CONF_KEY_FORMAT): cv.one_of(*KEY_FORMATS, lower=True),
-            # Hayward AquaLogic wired controllers are distinguished on the bus by the
-            # second byte of their frame_type: 0x02 = unit 1 (typically the main panel),
-            # 0x03 = unit 2 (the OEM wired remote), 0x04 = unit 3, etc. The hardware
-            # select pin on each physical keypad picks the value. wired_remote /
-            # wired_local key formats supply sensible defaults (0x03 / 0x02 respectively),
-            # but if your installation has multiple wired units and you want to mimic a
-            # specific one — or avoid colliding with the main panel's own 0x02 traffic —
-            # set this byte explicitly. Only meaningful with key_format wired_local or
-            # wired_remote; ignored for wireless / Jandy formats.
-            cv.Optional(CONF_WIRED_SUB_TYPE): validate_byte,
+            cv.Optional(CONF_COMMAND_FORMAT): COMMAND_FORMAT_SCHEMA,
             cv.Optional(CONF_DUMP_FRAMES, default=False): cv.boolean,
             cv.Optional(CONF_SNIFFER_ONLY, default=False): cv.boolean,
             # Minimum legal RX frame = DLE STX FT0 FT1 DLE ETX = 6 bytes (no CRC).
@@ -511,14 +556,19 @@ async def to_code(config):
     if (idle_cmd := tx.get(CONF_IDLE_COMMAND)) is not None:
         cg.add(var.set_idle_command(idle_cmd))
 
-    # key_format is only present when the profile supplies a default or the user set it
-    # explicitly. profile: generic_rs485_frame deliberately leaves it unset so the C++
-    # placeholder default (KEY_FORMAT_WIRELESS_12BYTE) is never reached — see the button
-    # platform's _final_validate, which rejects `command:` against such a hub.
-    if (kf := config.get(CONF_KEY_FORMAT)) is not None:
-        cg.add(var.set_key_format(KEY_FORMATS[kf]))
-    if (sub := config.get(CONF_WIRED_SUB_TYPE)) is not None:
-        cg.add(var.set_wired_sub_type(sub))
+    # command_format is only present when the profile supplies a default or the user set it
+    # explicitly. profile: generic_rs485_frame deliberately leaves it unset — the button
+    # platform's _final_validate rejects `command:` against a hub with no command_format.
+    if (cf := config.get(CONF_COMMAND_FORMAT)) is not None:
+        cg.add(
+            var.set_command_format(
+                cf[CONF_PREAMBLE],
+                cf[CONF_COMMAND_SIZE],
+                cf[CONF_COMMAND_ENDIAN] == "big",
+                cf[CONF_COMMAND_REPEAT],
+                cf[CONF_POSTAMBLE],
+            )
+        )
     cg.add(var.set_dump_frames(config[CONF_DUMP_FRAMES]))
     cg.add(var.set_sniffer_only(config[CONF_SNIFFER_ONLY]))
     cg.add(var.set_max_frame_length(config[CONF_MAX_FRAME_LENGTH]))

@@ -9,13 +9,18 @@ globals:
 rs485_frame:
   # Hub 1 — exercises on_frame: triggers + diagnostic sensors + button + number.
   # generic_rs485_frame profile skips UART enforcement so the shared 9600 8N1 UART works.
-  # key_format set explicitly so the `command:`-form button below is accepted (generic
-  # profiles do not supply a default key_format; the button platform's final_validate
-  # rejects `command:` against a generic hub without one).
+  # command_format set explicitly so the `command:`-form button below is accepted (generic
+  # profiles have no built-in command_format; the button platform's _final_validate
+  # rejects `command:` against a hub that lacks one). Uses the Hayward wireless encoding
+  # as a representative non-trivial format: 3-byte preamble, 4-byte cmd × 2, 1-byte pad.
   - id: rs485_frame_hub
     uart_id: uart_bus
     profile: generic_rs485_frame
-    key_format: wireless_12byte
+    command_format:
+      preamble: [0x00, 0x83, 0x01]
+      command_size: 4
+      command_repeat: 2
+      postamble: [0x00]
     dump_frames: true
     frame_timeout: 50ms
     on_frame:
@@ -150,14 +155,14 @@ sensor:
     decode: queue_depth
 
 button:
-  # Command-form: encodes via the hub's key_format (wireless_12byte here).
+  # Command-form: encodes via the hub's command_format (Hayward wireless here).
   - platform: rs485_frame
     rs485_frame_id: rs485_frame_hub
     name: "Lights Toggle"
     command: 0x00010000
 
-  # Raw-form: bypasses key_format entirely — frame_type + payload bytes go out as-is.
-  # Targets hub3 (generic profile with no key_format set) to prove the raw path works
+  # Raw-form: bypasses command_format entirely — frame_type + payload bytes go out as-is.
+  # Targets hub3 (generic profile with no command_format set) to prove the raw path works
   # when the command-form path would have been rejected.
   - platform: rs485_frame
     rs485_frame_id: rs485_frame_hub3

@@ -78,7 +78,12 @@ void RS485FrameHub::setup() {
   this->raw_frame_.reserve(this->max_frame_length_);
   this->rx_unescaped_.reserve(this->max_frame_length_);
   this->rx_payload_.reserve(this->max_frame_length_);
-  this->tx_payload_buf_.reserve(MAX_KEY_PAYLOAD_LEN);
+  // Reserve exactly what the configured command_format can produce. Zero for hubs with no
+  // command_format (generic_rs485_frame without one) — build_key_payload_ is never called.
+  const size_t key_payload_cap = this->cmd_preamble_.size() +
+                                 static_cast<size_t>(this->cmd_command_size_) * this->cmd_repeat_ +
+                                 this->cmd_postamble_.size();
+  this->tx_payload_buf_.reserve(key_payload_cap);
   // tx_escaped_buf_ worst case: every payload byte is DLE and requires an escape byte.
   this->tx_escaped_buf_.reserve(this->max_frame_length_ * 2);
   this->tx_frame_buf_.reserve(tx_slot_capacity);
@@ -434,71 +439,24 @@ void RS485FrameHub::build_frame_(const std::vector<uint8_t> &payload, std::vecto
 
 void RS485FrameHub::build_key_payload_(uint32_t command, std::vector<uint8_t> &out) const {
   out.clear();
-  if (this->key_format_ == KEY_FORMAT_WIRELESS_12BYTE) {
-    // Hayward wireless remote frame type 0x0083: 3-byte header + 4-byte key × 2 + 1 pad byte = 12 bytes.
-    // Source: https://github.com/swilson/aqualogic (bus captures, wireless remote protocol).
-    out.push_back(0x00);
-    out.push_back(0x83);  // frame sub-type: wireless keypress
-    out.push_back(0x01);  // sequence / channel byte, always 0x01 for single remote
-    for (int repeat = 0; repeat < 2; repeat++) {
-      out.push_back((command >> 24) & 0xFF);
-      out.push_back((command >> 16) & 0xFF);
-      out.push_back((command >> 8) & 0xFF);
-      out.push_back(command & 0xFF);
+  // Preamble bytes (e.g. frame sub-type header for Hayward / Jandy protocols).
+  for (uint8_t b : this->cmd_preamble_)
+    out.push_back(b);
+  // Command field: cmd_command_size_ bytes (1, 2, or 4) serialised big- or little-endian,
+  // repeated cmd_repeat_ times. For Hayward wired/wireless the panel expects the press
+  // payload repeated twice; for Jandy AllButton a single byte suffices.
+  for (uint8_t r = 0; r < this->cmd_repeat_; r++) {
+    if (this->cmd_big_endian_) {
+      for (int byte = static_cast<int>(this->cmd_command_size_) - 1; byte >= 0; byte--)
+        out.push_back((command >> (byte * 8)) & 0xFF);
+    } else {
+      for (uint8_t byte = 0; byte < this->cmd_command_size_; byte++)
+        out.push_back((command >> (byte * 8)) & 0xFF);
     }
-    out.push_back(0x00);  // trailing pad
-    return;
   }
-
-  if (this->key_format_ == KEY_FORMAT_JANDY_ALLBUTTON) {
-    // Jandy AquaLink RS AllButton response. Community-contributed; the third byte (0x80
-    // here) varies between reverse-engineered descriptions and has not been verified on
-    // physical hardware. If your master rejects responses, capture a known-good response
-    // and adjust this builder.
-    //
-    // Protocol envelope reference (DLE STX <data> <checksum> DLE ETX):
-    //   https://wiki.jmehan.com/display/KNOW/Jandy+Pool+Heater
-    // AllButton ACK byte sequence variants (community reverse-engineering):
-    //   https://github.com/earlephilhower/aquaweb/blob/master/protocol.md
-    out.push_back(0x00);
-    out.push_back(0x01);
-    out.push_back(0x80);
-    out.push_back(command & 0xFF);
-    return;
-  }
-
-  // Hayward wired remote / wired local: 2-byte frame type + 4-byte command (big-endian) ×
-  // 2 = 10 bytes payload before CRC. Same layout as the wireless 0x0083 form minus the
-  // 1-byte sequence prefix and 1-byte trailing pad — the wired-side controller does not
-  // need either, and the local panel observed on a live bus emits exactly this shape.
-  //
-  // Sub-type 0x02 = wired local (the main keypad on an AquaLogic / ProLogic panel).
-  //   Verified against a live AquaLogic bus 2026-05: pressed Menu / Right / AUX 1 / AUX 2 /
-  //   Heater / Valve 4 on the panel and observed `00 02 [cmd:4 BE] [cmd:4 BE] [sum16:2 BE]`
-  //   frames with the cmd field matching the wireless-remote command map (e.g. 0x00040000
-  //   for AUX 2, 0x00000400 for Heater). The second 4-byte block is the press payload
-  //   repeated; the panel emits the same block zeroed when reporting key release, but
-  //   sending the press-only form is sufficient for the panel to act on the command.
-  //
-  // Sub-type 0x03 = wired remote (the OEM spa-side wired remote, a separate physical
-  //   product on the same bus). Format is extrapolated from wired_local and is not yet
-  //   verified on real hardware; the spa-side remote uses the same command map, so the
-  //   payload structure is expected to be identical with only the frame sub-type byte
-  //   differing. Open an issue if your wired remote does not respond to this format.
-  out.push_back(0x00);
-  // Sub-type byte: explicit YAML override wins; otherwise pick the key_format default
-  // (0x03 for wired_remote = "additional registered keypad" — safer, no collision with
-  // main-panel traffic; 0x02 for wired_local = "main panel" — convenient but collides
-  // when the user also presses the physical panel).
-  uint8_t sub_type = this->has_wired_sub_type_override_ ? this->wired_sub_type_override_
-                                                        : (this->key_format_ == KEY_FORMAT_WIRED_REMOTE ? 0x03 : 0x02);
-  out.push_back(sub_type);
-  for (int repeat = 0; repeat < 2; repeat++) {
-    out.push_back((command >> 24) & 0xFF);
-    out.push_back((command >> 16) & 0xFF);
-    out.push_back((command >> 8) & 0xFF);
-    out.push_back(command & 0xFF);
-  }
+  // Postamble bytes (e.g. the trailing 0x00 pad in the Hayward wireless format).
+  for (uint8_t b : this->cmd_postamble_)
+    out.push_back(b);
 }
 
 void RS485FrameHub::maybe_tx_(uint32_t now) {
