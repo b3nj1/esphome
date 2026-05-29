@@ -1,84 +1,35 @@
-## Config-only validation tests for profile UART enforcement and gate-frame defaults.
-## These exercise validate_hub() + _final_validate() branches that the regular
-## test.*.yaml configs (which use generic_rs485_frame) do not reach. CI runs this with
-## `esphome config` only; it is never compiled.
+## Config-only validation tests for validate_hub() branches and the button platform's
+## _final_validate, which the compiled common.yaml does not all reach. CI runs this with
+## `esphome config` only; it is never compiled, so it uses the shared UART package like the
+## compiled tests (no profile-specific UART settings to enforce anymore).
 
-uart:
-  # Hayward profiles require 19200 8N2
-  - id: hayward_uart
-    tx_pin: GPIO17
-    rx_pin: GPIO16
-    baud_rate: 19200
-    data_bits: 8
-    parity: NONE
-    stop_bits: 2
-
-  # Jandy AquaLink RS requires 9600 8N1
-  - id: jandy_uart
-    tx_pin: GPIO19
-    rx_pin: GPIO18
-    baud_rate: 9600
-    data_bits: 8
-    parity: NONE
-    stop_bits: 1
-
-  # Generic UART with deliberately atypical settings — proves generic_rs485_frame
-  # skips final_validate UART enforcement entirely.
-  - id: generic_uart
-    tx_pin: GPIO21
-    rx_pin: GPIO22
-    baud_rate: 38400
-    data_bits: 7
-    parity: EVEN
-    stop_bits: 1
+packages:
+  uart: !include ../../test_build_components/common/uart/esp32-idf.yaml
 
 rs485_frame:
-  # Hayward wireless — profile injects command_format with preamble [0x00, 0x83, 0x01],
-  # 4-byte command × 2, trailing pad 0x00. Gate [0x01, 0x01].
-  - id: hayward_wireless_hub
-    uart_id: hayward_uart
-    profile: hayward_aqualogic_wireless
-
-  # Hayward wired remote — profile injects command_format preamble [0x00, 0x03].
-  - id: hayward_wired_remote_hub
-    uart_id: hayward_uart
-    profile: hayward_aqualogic_wired_remote
-
-  # Hayward wired local — profile injects command_format preamble [0x00, 0x02].
-  # Exercises explicit command_format override: impersonate unit 3 (0x04) instead of the
-  # profile default 0x02 to avoid colliding with main-panel keypress traffic.
-  # With command_format: the user just writes the preamble bytes they want — no separate
-  # wired_sub_type knob required.
-  - id: hayward_wired_local_hub
-    uart_id: hayward_uart
-    profile: hayward_aqualogic_wired_local
+  # frame_trigger gate (default mode) with an explicit gate.frame_type + a command_format,
+  # so the `command:`-form button below is accepted.
+  - id: cmd_hub
+    uart_id: uart_bus
+    crc:
+      type: sum16
+      rx_accept: [header_inclusive, payload_only]
+      tx_variant: header_inclusive
+    tx:
+      gate:
+        frame_type: [0x01, 0x01]
     command_format:
-      preamble: [0x00, 0x04]
+      preamble: [0x00, 0x83, 0x01]
       command_size: 4
       command_repeat: 2
+      postamble: [0x00]
 
-  # Jandy AllButton emulator — profile injects gate frame [0x08, 0x00] (AllButton probe),
-  # sum8 header-inclusive CRC, and command_format with 1-byte command. Requires idle_command.
-  - id: jandy_hub
-    uart_id: jandy_uart
-    profile: jandy_aqualink_rs
-    tx:
-      idle_command: 0x00
-
-  # Jandy in sniffer mode — exempted from the idle_command requirement.
-  - id: jandy_sniffer_hub
-    uart_id: jandy_uart
-    profile: jandy_aqualink_rs
+  # Sniffer-only hub: exempt from the frame_trigger gate.frame_type requirement, and
+  # exercises sniffer_stats: with no explicit reference_frame_type so the default-to-gate
+  # fallback in to_code is reached during config-only validation. crc: type none.
+  - id: sniffer_hub
+    uart_id: uart_bus
     sniffer_only: true
-
-  # Generic profile bypasses final_validate UART enforcement so 38400 7E1 is accepted.
-  # Also exercises sniffer_stats: without an explicit reference_frame_type to confirm the
-  # default-to-gate fallback in to_code is reached during config-only validation.
-  # No command_format set: validates that generic hubs omit it from defaults (so the button
-  # platform's _final_validate can detect "command: against a hub with no command_format").
-  - id: generic_hub
-    uart_id: generic_uart
-    profile: generic_rs485_frame
     crc:
       type: none
     tx:
@@ -86,39 +37,48 @@ rs485_frame:
         mode: idle_gap
     sniffer_stats: {}
 
-  # Generic profile with an explicit command_format: validates that command:-form buttons
-  # are accepted against generic hubs when the user opts in by adding command_format:.
-  # Uses the Jandy AllButton encoding as a representative 1-byte command example.
-  - id: generic_hub_with_command_format
-    uart_id: generic_uart
-    profile: generic_rs485_frame
-    command_format:
-      preamble: [0x00, 0x01, 0x80]
-      command_size: 1
+  # Raw-only generic hub with custom (non-default) framing bytes — exercises the framing
+  # distinctness validation passing, and is the target of the raw-form button below (no
+  # command_format, so the `command:` form would be rejected against it).
+  - id: raw_hub
+    uart_id: uart_bus
+    framing:
+      dle: 0x7D
+      stx: 0x01
+      etx: 0x04
+      escape_byte: 0x00
     crc:
-      type: sum8
+      type: xor8
     tx:
       gate:
         mode: idle_gap
 
-# Buttons exercise the mutually-exclusive command vs frame_type+payload validation.
-# All branches of _validate_button + _final_validate are reached:
-#   - command-form against a profile that supplies command_format (hayward_wireless_hub)
-#   - raw form against a generic hub with no command_format (generic_hub)
-#   - command-form against a generic hub with explicit command_format (generic_hub_with_command_format)
+  # idle_command requires a command_format so the value has a defined encoding. fixed_delay
+  # gate mode (no gate.frame_type needed).
+  - id: idle_hub
+    uart_id: uart_bus
+    crc:
+      type: sum8
+    command_format:
+      preamble: [0x00, 0x01, 0x80]
+      command_size: 1
+    tx:
+      gate:
+        mode: fixed_delay
+        interval: 250ms
+      idle_command: 0x00
+
+# Buttons exercise both _final_validate branches:
+#   - command-form against a hub that has a command_format (cmd_hub)  -> accepted
+#   - raw form against a hub with no command_format (raw_hub)         -> accepted
 button:
   - platform: rs485_frame
-    rs485_frame_id: hayward_wireless_hub
-    name: "Validate Lights"
+    rs485_frame_id: cmd_hub
+    name: "Validate Command"
     command: 0x00010000
 
   - platform: rs485_frame
-    rs485_frame_id: generic_hub
+    rs485_frame_id: raw_hub
     name: "Validate Raw"
     frame_type: [0x00, 0xA1]
     payload: [0x01, 0x02, 0x03, 0x04]
-
-  - platform: rs485_frame
-    rs485_frame_id: generic_hub_with_command_format
-    name: "Validate Command Override"
-    command: 0x00000001

@@ -84,6 +84,9 @@ void RS485FrameHub::setup() {
                                  static_cast<size_t>(this->cmd_command_size_) * this->cmd_repeat_ +
                                  this->cmd_postamble_.size();
   this->tx_payload_buf_.reserve(key_payload_cap);
+  // send_assembly_buf_ holds an assembled frame_type+payload before framing; it can never
+  // legitimately exceed max_frame_length_ (queue_raw_frame rejects anything larger).
+  this->send_assembly_buf_.reserve(this->max_frame_length_);
   // tx_escaped_buf_ worst case: every payload byte is DLE and requires an escape byte.
   this->tx_escaped_buf_.reserve(this->max_frame_length_ * 2);
   this->tx_frame_buf_.reserve(tx_slot_capacity);
@@ -118,7 +121,7 @@ void RS485FrameHub::loop() {
   if (this->tx_start_pending_ && now - this->tx_start_at_ < 0x80000000UL) {
     this->tx_start_pending_ = false;
     this->write_frame_(this->pending_tx_frame_);
-    this->last_tx_time_ = now;
+    this->mark_transmitted_(now);
     if (!this->pending_is_idle_)
       this->commands_sent_++;
     this->pending_is_idle_ = false;
@@ -166,6 +169,14 @@ bool RS485FrameHub::queue_command_value(uint32_t command) {
     return false;
   }
   this->build_key_payload_(command, this->tx_payload_buf_);
+  // A command_format whose encoded payload exceeds max_frame_length_ would overflow the
+  // pre-reserved TX buffers in build_frame_. Drop rather than reallocate after setup().
+  if (this->tx_payload_buf_.size() > this->max_frame_length_) {
+    ESP_LOGW(TAG, "Command payload (%zu) exceeds max_frame_length (%" PRIu32 "); dropping",
+             this->tx_payload_buf_.size(), this->max_frame_length_);
+    this->command_drops_++;
+    return false;
+  }
   this->build_frame_(this->tx_payload_buf_, this->tx_frame_buf_);
   return this->enqueue_frame_();
 }
@@ -205,6 +216,8 @@ void RS485FrameHub::read_uart_(uint32_t now) {
   uint8_t byte;
   while (this->available() && this->read_byte(&byte)) {
     this->last_rx_time_ = now;
+    this->last_activity_time_ = now;
+    this->has_activity_ = true;
     if (!this->in_frame_) {
       if (this->previous_byte_ == this->dle_ && byte == this->stx_) {
         this->in_frame_ = true;
@@ -468,11 +481,18 @@ void RS485FrameHub::maybe_tx_(uint32_t now) {
   const bool queue_or_idle = this->queue_size_() > 0 || this->has_idle_command_;
   if (!queue_or_idle)
     return;
-  if (this->tx_gate_mode_ == TX_GATE_IDLE_GAP && this->last_rx_time_ != 0 &&
-      now - this->last_rx_time_ >= this->tx_idle_gap_)
+  // idle_gap fires when the bus has been silent (no RX and no TX) for tx_idle_gap_. Keying
+  // off last_activity_time_ (advanced on both RX and our own TX) means an idle keepalive we
+  // emit resets the timer — otherwise, on a half-duplex bus where we don't hear our own
+  // transmission, the gate would re-fire every loop.
+  if (this->tx_gate_mode_ == TX_GATE_IDLE_GAP && this->has_activity_ &&
+      now - this->last_activity_time_ >= this->tx_idle_gap_)
     this->send_next_(now);
+  // fixed_delay fires on a fixed period. has_tx_ever_ is an explicit "never transmitted"
+  // flag so the first fire is not gated, without overloading last_tx_time_ == 0 (which is a
+  // legitimate timestamp at boot and across the millis rollover).
   if (this->tx_gate_mode_ == TX_GATE_FIXED_DELAY &&
-      (this->last_tx_time_ == 0 || now - this->last_tx_time_ >= this->tx_fixed_interval_))
+      (!this->has_tx_ever_ || now - this->last_tx_time_ >= this->tx_fixed_interval_))
     this->send_next_(now);
 }
 
@@ -522,7 +542,7 @@ void RS485FrameHub::send_next_(uint32_t now) {
 
   this->write_frame_(this->tx_queue_[this->tx_queue_head_]);
   this->queue_pop_front_();
-  this->last_tx_time_ = now;
+  this->mark_transmitted_(now);
   this->commands_sent_++;
 }
 
@@ -537,7 +557,7 @@ void RS485FrameHub::send_next_idle_(uint32_t now) {
     return;
   }
   this->write_frame_(this->tx_frame_buf_);
-  this->last_tx_time_ = now;
+  this->mark_transmitted_(now);
   // Idle keepalives are not counted in commands_sent_ — that counter tracks only real HA commands.
 }
 
@@ -547,7 +567,35 @@ bool RS485FrameHub::queue_raw_frame(const std::vector<uint8_t> &payload) {
     this->command_drops_++;
     return false;
   }
+  // Bound the payload to max_frame_length_: build_frame_ writes into pre-reserved buffers
+  // sized for that worst case, so an oversized payload would force a post-setup realloc.
+  if (payload.size() > this->max_frame_length_) {
+    ESP_LOGW(TAG, "Raw frame payload (%zu) exceeds max_frame_length (%" PRIu32 "); dropping", payload.size(),
+             this->max_frame_length_);
+    this->command_drops_++;
+    return false;
+  }
   this->build_frame_(payload, this->tx_frame_buf_);
+  return this->enqueue_frame_();
+}
+
+bool RS485FrameHub::queue_raw_frame(const std::vector<uint8_t> &frame_type, const std::vector<uint8_t> &payload) {
+  if (this->sniffer_only_) {
+    ESP_LOGW(TAG, "Ignoring raw frame because sniffer_only is enabled");
+    this->command_drops_++;
+    return false;
+  }
+  if (frame_type.size() + payload.size() > this->max_frame_length_) {
+    ESP_LOGW(TAG, "Raw frame (%zu) exceeds max_frame_length (%" PRIu32 "); dropping",
+             frame_type.size() + payload.size(), this->max_frame_length_);
+    this->command_drops_++;
+    return false;
+  }
+  // Assemble into the pre-reserved buffer — no per-call allocation.
+  this->send_assembly_buf_.clear();
+  this->send_assembly_buf_.insert(this->send_assembly_buf_.end(), frame_type.begin(), frame_type.end());
+  this->send_assembly_buf_.insert(this->send_assembly_buf_.end(), payload.begin(), payload.end());
+  this->build_frame_(this->send_assembly_buf_, this->tx_frame_buf_);
   return this->enqueue_frame_();
 }
 
@@ -574,6 +622,12 @@ void RS485FrameButton::press_action() {
 #endif  // USE_BUTTON
 
 #ifdef USE_NUMBER
+// control() is a user-initiated path (a slider/number set from HA or an automation), not a
+// hot loop, so the std::vector the lambda returns is an acceptable per-action allocation —
+// the same trade-off the templatable send_frame action makes. The platform exists so a
+// number entity can map a scalar to an encoded frame (e.g. pump speed -> command bytes)
+// without the user writing a button per value; queue_raw_frame still enforces the length
+// bound and no-heap-after-setup on the actual TX buffers.
 void RS485FrameNumber::control(float value) {
   if (this->lambda_ == nullptr)
     return;

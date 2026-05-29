@@ -59,7 +59,8 @@ _DECODE_DEFAULTS = {
     },
     "queue_depth": {
         CONF_STATE_CLASS: STATE_CLASS_MEASUREMENT,
-        CONF_UNIT_OF_MEASUREMENT: "frames",
+        # The TX queue holds pending commands; match the commands_sent / command_drops unit.
+        CONF_UNIT_OF_MEASUREMENT: "commands",
     },
 }
 

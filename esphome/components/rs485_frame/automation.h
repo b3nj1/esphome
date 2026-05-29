@@ -21,13 +21,9 @@ template<typename... Ts> class SendFrameAction : public Action<Ts...>, public Pa
   TEMPLATABLE_VALUE(std::vector<uint8_t>, payload)
 
   void play(Ts... x) override {
-    auto frame_type = this->frame_type_.value(x...);
-    auto payload = this->payload_.value(x...);
-    std::vector<uint8_t> full;
-    full.reserve(frame_type.size() + payload.size());
-    full.insert(full.end(), frame_type.begin(), frame_type.end());
-    full.insert(full.end(), payload.begin(), payload.end());
-    this->parent_->queue_raw_frame(full);
+    // Hand the two byte lists to the hub, which assembles them into a pre-reserved buffer
+    // and enforces max_frame_length — no per-call assembly vector here.
+    this->parent_->queue_raw_frame(this->frame_type_.value(x...), this->payload_.value(x...));
   }
 };
 

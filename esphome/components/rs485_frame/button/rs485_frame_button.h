@@ -9,14 +9,15 @@ namespace esphome::rs485_frame {
 
 /// Press-only button bound to an RS485FrameHub. Two construction modes:
 ///
-///   1. `command:` form — the hub uses its configured key_format (wireless_12byte,
-///      wired_remote, etc.) to encode `command_value` into the on-wire payload.
-///      Restricted to profiles that supply a key_format (i.e. not generic).
+///   1. `command:` form — the hub uses its configured command_format (preamble /
+///      command_size / endianness / repeat / postamble) to encode `command_value` into
+///      the on-wire payload. Restricted to hubs that have a command_format set; the
+///      button platform's _final_validate rejects this form against a hub that has none.
 ///
 ///   2. Raw form — caller supplies the frame_type prefix and the full unframed payload.
 ///      The hub adds DLE-STX/ETX wrapping, byte-stuffing, and CRC, but the payload
-///      bytes are otherwise emitted verbatim. This is the path that lets
-///      generic_rs485_frame drive button entities without any built-in key_format.
+///      bytes are otherwise emitted verbatim. This is the path that lets a hub with no
+///      command_format drive button entities.
 ///
 /// The two modes are constructor-distinguished: there is one constructor per mode.
 /// raw_mode_ is set from the constructor and is immutable for the lifetime of the

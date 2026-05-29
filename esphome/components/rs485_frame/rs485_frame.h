@@ -176,6 +176,9 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
 
   bool queue_command_value(uint32_t command);
   bool queue_raw_frame(const std::vector<uint8_t> &payload);
+  // Assemble frame_type + payload into a pre-reserved buffer and queue it. Used by the
+  // send_frame action and the raw-form button so neither allocates a per-call vector.
+  bool queue_raw_frame(const std::vector<uint8_t> &frame_type, const std::vector<uint8_t> &payload);
   void register_trigger(RS485FrameTrigger *trigger) { this->triggers_.push_back(trigger); }
 
   uint32_t get_frames_received() const { return this->frames_received_; }
@@ -205,6 +208,14 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   size_t queue_size_() const { return this->tx_queue_count_; }
   void queue_pop_front_();
   void write_frame_(const std::vector<uint8_t> &frame);
+  // Record a transmission: advances last_tx_time_ and the bus-activity timestamp, and
+  // latches has_tx_ever_ so the fixed_delay gate has an unambiguous "has transmitted" flag.
+  void mark_transmitted_(uint32_t now) {
+    this->last_tx_time_ = now;
+    this->last_activity_time_ = now;
+    this->has_activity_ = true;
+    this->has_tx_ever_ = true;
+  }
 
   uint8_t dle_{0x10};
   uint8_t stx_{0x02};
@@ -215,7 +226,10 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   CrcType crc_type_{CRC_TYPE_SUM16};
   CrcVariant tx_crc_variant_{CRC_HEADER_INCLUSIVE};
   TxGateMode tx_gate_mode_{TX_GATE_FRAME_TRIGGER};
-  StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> tx_gate_frame_type_{0x01, 0x01};
+  // Empty by default: there is no protocol-agnostic gate frame. The Python schema requires
+  // tx.gate.frame_type for frame_trigger mode, so this is only empty for idle_gap /
+  // fixed_delay / sniffer hubs, where the frame matcher must never fire.
+  StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> tx_gate_frame_type_;
   uint32_t tx_gate_delay_{0};
   uint32_t tx_idle_gap_{4};
   uint32_t tx_fixed_interval_{100};
@@ -255,6 +269,14 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   uint32_t last_ka_time_{0};
   uint32_t last_keepalive_ms_{0};
   uint32_t last_tx_time_{0};
+  // Bus-activity tracking for the idle_gap gate: last_activity_time_ advances on both RX and
+  // TX so an idle keepalive we transmit ourselves resets the idle timer (otherwise the gate,
+  // which can't hear its own half-duplex transmission, would re-fire every loop). has_tx_ever_
+  // is an explicit "has transmitted" flag for the fixed_delay gate so a legitimate now==0 at
+  // boot is not mistaken for the never-sent sentinel.
+  uint32_t last_activity_time_{0};
+  bool has_activity_{false};
+  bool has_tx_ever_{false};
   bool tx_start_pending_{false};
   bool pending_is_idle_{false};  // true when pending_tx_frame_ is an idle keepalive, not a real command
   uint32_t tx_start_at_{0};
@@ -266,6 +288,9 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   std::vector<uint8_t> tx_payload_buf_;
   std::vector<uint8_t> tx_escaped_buf_;
   std::vector<uint8_t> tx_frame_buf_;
+  // Holds frame_type + payload concatenated for the two-argument queue_raw_frame(); reserved
+  // to max_frame_length_ in setup() so the send_frame action / raw button never allocate.
+  std::vector<uint8_t> send_assembly_buf_;
 
   // Setup-time allocated hex-text buffer for dump_frames logging. Sized to fit the
   // worst-case TX frame (max_frame_length_ * 2 + FRAME_OVERHEAD_BYTES bytes fully

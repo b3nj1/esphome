@@ -8,14 +8,18 @@ globals:
 
 rs485_frame:
   # Hub 1 — exercises on_frame: triggers + diagnostic sensors + button + number.
-  # generic_rs485_frame profile skips UART enforcement so the shared 9600 8N1 UART works.
-  # command_format set explicitly so the `command:`-form button below is accepted (generic
-  # profiles have no built-in command_format; the button platform's _final_validate
-  # rejects `command:` against a hub that lacks one). Uses the Hayward wireless encoding
-  # as a representative non-trivial format: 3-byte preamble, 4-byte cmd × 2, 1-byte pad.
+  # crc: is required (there are no profile defaults). command_format: is set explicitly so
+  # the `command:`-form button below is accepted (the button platform's _final_validate
+  # rejects `command:` against a hub with no command_format). The default frame_trigger gate
+  # mode requires an explicit gate.frame_type. A representative non-trivial command_format:
+  # 3-byte preamble, 4-byte command x 2, 1-byte pad.
   - id: rs485_frame_hub
     uart_id: uart_bus
-    profile: generic_rs485_frame
+    crc:
+      type: sum16
+    tx:
+      gate:
+        frame_type: [0x01, 0x01]
     command_format:
       preamble: [0x00, 0x83, 0x01]
       command_size: 4
@@ -68,7 +72,6 @@ rs485_frame:
   # USE_RS485_FRAME_SNIFFER_STATS gated code paths are compiled by CI.
   - id: rs485_frame_hub2
     uart_id: uart_bus
-    profile: generic_rs485_frame
     sniffer_only: true
     crc:
       type: crc16_modbus
@@ -86,16 +89,31 @@ rs485_frame:
       payload_dump_top: 2
       reference_frame_type: [0x01, 0x01]
 
-  # Hub 3 — fixed_delay gate with XOR8 CRC and an idle_command set.
+  # Hub 3 — generic raw hub with no command_format: target of the raw-form button and the
+  # send_frame action, proving the raw transmit path works without any command_format. XOR8
+  # CRC, fixed_delay gate.
   - id: rs485_frame_hub3
     uart_id: uart_bus
-    profile: generic_rs485_frame
     crc:
       type: xor8
     tx:
       gate:
         mode: fixed_delay
         interval: 500ms
+
+  # Hub 4 — exercises the idle_command path (send_next_idle_ / build_key_payload_). idle_command
+  # requires a command_format so the value has a defined on-wire encoding; a 1-byte command is
+  # used here. idle_gap gate so the keepalive is emitted after bus silence.
+  - id: rs485_frame_hub4
+    uart_id: uart_bus
+    crc:
+      type: sum8
+    command_format:
+      command_size: 1
+    tx:
+      gate:
+        mode: idle_gap
+        min_silence: 20ms
       idle_command: 0x00
 
 binary_sensor:
@@ -155,15 +173,15 @@ sensor:
     decode: queue_depth
 
 button:
-  # Command-form: encodes via the hub's command_format (Hayward wireless here).
+  # Command-form: encodes via the hub's command_format.
   - platform: rs485_frame
     rs485_frame_id: rs485_frame_hub
     name: "Lights Toggle"
     command: 0x00010000
 
   # Raw-form: bypasses command_format entirely — frame_type + payload bytes go out as-is.
-  # Targets hub3 (generic profile with no command_format set) to prove the raw path works
-  # when the command-form path would have been rejected.
+  # Targets hub3 (no command_format set) to prove the raw path works when the command-form
+  # path would have been rejected by the button platform's _final_validate.
   - platform: rs485_frame
     rs485_frame_id: rs485_frame_hub3
     name: "Generic Probe Frame"

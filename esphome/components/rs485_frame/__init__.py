@@ -1,10 +1,8 @@
 from esphome import automation
 import esphome.codegen as cg
 from esphome.components import uart
-from esphome.components.const import CONF_DATA_BITS, CONF_PARITY, CONF_STOP_BITS
 import esphome.config_validation as cv
 from esphome.const import (
-    CONF_BAUD_RATE,
     CONF_DELAY,
     CONF_ID,
     CONF_INTERVAL,
@@ -12,10 +10,8 @@ from esphome.const import (
     CONF_PAYLOAD,
     CONF_TRIGGER_ID,
     CONF_TYPE,
-    CONF_UART_ID,
 )
 from esphome.core import HexInt
-import esphome.final_validate as fv
 
 CODEOWNERS = ["@b3nj1"]
 DEPENDENCIES = ["uart"]
@@ -61,7 +57,6 @@ CONF_PAYLOAD_CAPTURE_BYTES = "payload_capture_bytes"
 CONF_PAYLOAD_DUMP_TOP = "payload_dump_top"
 CONF_POSTAMBLE = "postamble"
 CONF_PREAMBLE = "preamble"
-CONF_PROFILE = "profile"
 CONF_QUEUE_POLICY = "queue_policy"
 CONF_REFERENCE_FRAME_TYPE = "reference_frame_type"
 CONF_RX_ACCEPT = "rx_accept"
@@ -72,12 +67,6 @@ CONF_ON_FRAME = "on_frame"
 CONF_IDLE_COMMAND = "idle_command"
 CONF_TX = "tx"
 CONF_TX_VARIANT = "tx_variant"
-
-PROFILE_HAYWARD_WIRELESS = "hayward_aqualogic_wireless"
-PROFILE_HAYWARD_WIRED_REMOTE = "hayward_aqualogic_wired_remote"
-PROFILE_HAYWARD_WIRED_LOCAL = "hayward_aqualogic_wired_local"
-PROFILE_JANDY_RS = "jandy_aqualink_rs"
-PROFILE_GENERIC = "generic_rs485_frame"
 
 CRC_VARIANTS = {
     "header_inclusive": CrcVariant.CRC_HEADER_INCLUSIVE,
@@ -170,10 +159,11 @@ def _validate_command_format_bytes(max_len: int):
 
 
 # Schema for command_format: — defines how a uint32 `command:` value is serialised into
-# the frame payload. Replaces the old key_format: enum + wired_sub_type: knob with a
-# single data-driven block that can express any current or future protocol variant without
-# touching C++. Named profiles supply a command_format: default; generic_rs485_frame hubs
-# omit it (the button platform's _final_validate rejects `command:` against such hubs).
+# the frame payload. A single data-driven block that can express any protocol variant
+# without touching C++ (preamble bytes, command field size/endianness/repeat, postamble
+# bytes). command_format: is optional: hubs without it can only transmit via the raw
+# `frame_type` + `payload` button form or the rs485_frame.send_frame action — the button
+# platform's _final_validate rejects the `command:` shorthand against a hub that has none.
 COMMAND_FORMAT_SCHEMA = cv.Schema(
     {
         cv.Optional(CONF_PREAMBLE, default=[]): _validate_command_format_bytes(
@@ -191,87 +181,6 @@ COMMAND_FORMAT_SCHEMA = cv.Schema(
 )
 
 
-# Internal dict key used by _profile_defaults to carry a profile-specific TX gate frame
-# default into validate_hub. Not a YAML option (the leading underscore signals "private"),
-# and intentionally not named CONF_* because it never appears in a user-facing schema.
-_PROFILE_GATE_FRAME_TYPE = "_gate_frame_type"
-
-
-def _profile_defaults(profile):
-    if profile == PROFILE_HAYWARD_WIRED_REMOTE:
-        # Verified via live bus capture 2026-05: Hayward AquaLogic frames on the wired bus
-        # all use sum16 header_inclusive (DLE+STX bytes participate in the checksum).
-        # Sub-type 0x03 = "additional wired keypad" — avoids colliding with the main
-        # panel's own 0x02 traffic during simultaneous local-keypress + HA-keypress.
-        # To impersonate a different unit-address, set command_format.preamble explicitly
-        # (e.g. preamble: [0x00, 0x04] for unit 3) — no separate knob needed.
-        return {
-            CONF_COMMAND_FORMAT: {
-                CONF_PREAMBLE: [HexInt(0x00), HexInt(0x03)],
-                CONF_COMMAND_SIZE: 4,
-                CONF_COMMAND_ENDIAN: "big",
-                CONF_COMMAND_REPEAT: 2,
-                CONF_POSTAMBLE: [],
-            },
-            CONF_TX_VARIANT: "header_inclusive",
-        }
-    if profile == PROFILE_HAYWARD_WIRED_LOCAL:
-        # Same CRC story as wired_remote. Sub-type 0x02 impersonates unit 1 (main panel);
-        # risks collision with the panel's own keypress traffic on a live installation.
-        # Override preamble: [0x00, 0x03] (or higher) to impersonate a different unit.
-        return {
-            CONF_COMMAND_FORMAT: {
-                CONF_PREAMBLE: [HexInt(0x00), HexInt(0x02)],
-                CONF_COMMAND_SIZE: 4,
-                CONF_COMMAND_ENDIAN: "big",
-                CONF_COMMAND_REPEAT: 2,
-                CONF_POSTAMBLE: [],
-            },
-            CONF_TX_VARIANT: "header_inclusive",
-        }
-    if profile == PROFILE_JANDY_RS:
-        # Jandy AquaLink RS AllButton ACK. Protocol envelope: DLE STX <data> <sum8> DLE ETX.
-        # Third preamble byte 0x80 is community-reverse-engineered; if your master rejects
-        # responses, capture a known-good frame and adjust preamble: accordingly.
-        # References:
-        #   https://wiki.jmehan.com/display/KNOW/Jandy+Pool+Heater
-        #   https://github.com/earlephilhower/aquaweb/blob/master/protocol.md
-        return {
-            CONF_COMMAND_FORMAT: {
-                CONF_PREAMBLE: [HexInt(0x00), HexInt(0x01), HexInt(0x80)],
-                CONF_COMMAND_SIZE: 1,
-                CONF_COMMAND_ENDIAN: "big",
-                CONF_COMMAND_REPEAT: 1,
-                CONF_POSTAMBLE: [],
-            },
-            CONF_TX_VARIANT: "header_inclusive",
-            CONF_TYPE: "sum8",
-            CONF_RX_ACCEPT: ["header_inclusive"],
-            # AllButton address 0x08 + CMD_PROBE 0x00. Jandy AllButton devices live at
-            # 0x08..0x0B; a user with a different address must override this explicitly.
-            _PROFILE_GATE_FRAME_TYPE: [0x08, 0x00],
-        }
-    if profile == PROFILE_HAYWARD_WIRELESS:
-        # Hayward wireless remote: 3-byte header + 4-byte key × 2 + 1 pad = 12-byte payload.
-        # Source: https://github.com/swilson/aqualogic (bus captures, wireless remote protocol).
-        return {
-            CONF_COMMAND_FORMAT: {
-                CONF_PREAMBLE: [HexInt(0x00), HexInt(0x83), HexInt(0x01)],
-                CONF_COMMAND_SIZE: 4,
-                CONF_COMMAND_ENDIAN: "big",
-                CONF_COMMAND_REPEAT: 2,
-                CONF_POSTAMBLE: [HexInt(0x00)],
-            },
-            CONF_TX_VARIANT: "header_inclusive",
-        }
-    # PROFILE_GENERIC: no command_format default. The `command:` form on the button platform
-    # requires a command_format on the hub; omitting it here forces generic users onto the
-    # raw `frame_type` + `payload` form, or to set command_format: explicitly if they want
-    # the encoder. The button platform's _final_validate rejects `command:` against a
-    # generic hub that has no command_format.
-    return {CONF_TX_VARIANT: "header_inclusive"}
-
-
 FRAMING_SCHEMA = cv.Schema(
     {
         cv.Optional(CONF_DLE, default=0x10): validate_byte,
@@ -283,15 +192,19 @@ FRAMING_SCHEMA = cv.Schema(
 
 CRC_SCHEMA = cv.Schema(
     {
-        cv.Optional(CONF_TYPE, default="sum16"): cv.one_of(*CRC_TYPES, lower=True),
+        # crc.type is required: there is no universally-correct default across DLE-framed
+        # buses, so the user must declare the algorithm their device uses (use "none" to
+        # accept any structurally-valid frame, e.g. while discovering an unknown bus).
+        cv.Required(CONF_TYPE): cv.one_of(*CRC_TYPES, lower=True),
         cv.Optional(
             CONF_RX_ACCEPT, default=["header_inclusive", "payload_only"]
         ): cv.ensure_list(cv.one_of(*CRC_VARIANTS, lower=True)),
-        # tx_variant has no schema-level default because the correct default is
-        # profile-dependent (Hayward wired uses "payload_only"; all others use
-        # "header_inclusive"). validate_hub() always injects it from _profile_defaults()
-        # if the user does not set it explicitly.
-        cv.Optional(CONF_TX_VARIANT): cv.one_of(*CRC_VARIANTS, lower=True),
+        # tx_variant selects whether the DLE+STX header bytes participate in the transmitted
+        # CRC. header_inclusive is the common case; set payload_only for buses that checksum
+        # only the unescaped payload. It is a mechanical (not vendor) choice, so it defaults.
+        cv.Optional(CONF_TX_VARIANT, default="header_inclusive"): cv.one_of(
+            *CRC_VARIANTS, lower=True
+        ),
     }
 )
 
@@ -300,9 +213,9 @@ TX_GATE_SCHEMA = cv.Schema(
         cv.Optional(CONF_MODE, default="frame_trigger"): cv.one_of(
             *TX_GATE_MODES, lower=True
         ),
-        # No schema-level default for frame_type — _profile_defaults() supplies a
-        # profile-appropriate value (Hayward keep-alive [0x01,0x01], Jandy probe
-        # [0x08,0x00], etc.) in validate_hub. Required for frame_trigger mode.
+        # No schema-level default for frame_type: it is device-specific (the bus keep-alive /
+        # poll frame the hub transmits after). validate_hub() requires it for frame_trigger
+        # mode; idle_gap and fixed_delay modes do not use it.
         cv.Optional(CONF_FRAME_TYPE): validate_frame_type,
         # delay=0 is valid (no delay after the gate frame before transmitting).
         cv.Optional(CONF_DELAY, default="0ms"): cv.positive_time_period_milliseconds,
@@ -385,34 +298,37 @@ SNIFFER_STATS_SCHEMA = cv.Schema(
 
 
 def validate_hub(config):
-    profile = config[CONF_PROFILE]
-    defaults = _profile_defaults(profile)
+    # Framing-byte distinctness. The framer uses DLE as the escape introducer: in-frame,
+    # DLE+STX starts a frame, DLE+ETX ends it, and DLE+escape_byte is a literal DLE. If any
+    # of DLE/STX/ETX collide, or escape_byte equals STX or ETX, the byte stream is no longer
+    # unambiguously parseable. Reject at config time rather than emitting unframeable data.
+    framing = config[CONF_FRAMING]
+    dle = framing[CONF_DLE]
+    stx = framing[CONF_STX]
+    etx = framing[CONF_ETX]
+    escape = framing[CONF_ESCAPE_BYTE]
+    if len({int(dle), int(stx), int(etx)}) != 3:
+        raise cv.Invalid("framing dle, stx and etx must all be distinct byte values")
+    if int(escape) in (int(stx), int(etx)):
+        raise cv.Invalid(
+            "framing escape_byte must differ from stx and etx; otherwise an escaped DLE "
+            "is indistinguishable from a frame start/end terminator"
+        )
 
-    if CONF_COMMAND_FORMAT not in config and CONF_COMMAND_FORMAT in defaults:
-        config[CONF_COMMAND_FORMAT] = defaults[CONF_COMMAND_FORMAT]
-
-    if CONF_TX_VARIANT not in config[CONF_CRC]:
-        config[CONF_CRC][CONF_TX_VARIANT] = defaults[CONF_TX_VARIANT]
-    if CONF_TYPE in defaults and CONF_TYPE not in config[CONF_CRC]:
-        config[CONF_CRC][CONF_TYPE] = defaults[CONF_TYPE]
-    if CONF_RX_ACCEPT in defaults and CONF_RX_ACCEPT not in config[CONF_CRC]:
-        config[CONF_CRC][CONF_RX_ACCEPT] = defaults[CONF_RX_ACCEPT]
-
-    # gate.frame_type default is profile-dependent. _profile_defaults supplies a default
-    # for Jandy (the probe frame); other profiles fall back to the Hayward keepalive.
     gate = config[CONF_TX][CONF_GATE]
-    if CONF_FRAME_TYPE not in gate:
-        gate[CONF_FRAME_TYPE] = defaults.get(_PROFILE_GATE_FRAME_TYPE, [0x01, 0x01])
-
     sniffer_only = config[CONF_SNIFFER_ONLY]
     gate_mode = gate[CONF_MODE]
 
-    # When in frame_trigger gate mode (non-sniffer), the gate frame type must not be
-    # empty — otherwise the gate would never fire and queued commands would accumulate
-    # forever. Setup-time runtime warning is too late; reject at config time.
-    if gate_mode == "frame_trigger" and not gate[CONF_FRAME_TYPE] and not sniffer_only:
+    # In frame_trigger gate mode (non-sniffer), the gate frame type must be a non-empty byte
+    # list — otherwise the gate would never fire and queued commands would accumulate
+    # forever. There is no profile default to fall back on, so require it explicitly.
+    if (
+        gate_mode == "frame_trigger"
+        and not gate.get(CONF_FRAME_TYPE)
+        and not sniffer_only
+    ):
         raise cv.Invalid(
-            "tx.gate.frame_type must be a non-empty byte list when tx.gate.mode is "
+            "tx.gate.frame_type is required (a non-empty byte list) when tx.gate.mode is "
             "frame_trigger; the gate would never fire and queued commands would not transmit"
         )
 
@@ -422,18 +338,14 @@ def validate_hub(config):
     ):
         raise cv.Invalid("replace_latest requires max_queue_size: 1")
 
-    # Jandy AllButton emulation only works if the AllButton device ACKs every probe.
-    # Without idle_command the device would only respond when a real button is queued,
-    # and the master would mark the AllButton offline between presses.
-    if (
-        profile == PROFILE_JANDY_RS
-        and not sniffer_only
-        and CONF_IDLE_COMMAND not in config[CONF_TX]
-    ):
+    # tx.idle_command is a uint32 that the hub serialises via command_format on every gate
+    # with an empty queue. Without a command_format there is no defined encoding, so reject
+    # the combination rather than silently emitting an undocumented default 4-byte big-endian
+    # encoding (mirrors the button platform's `command:` rule).
+    if CONF_IDLE_COMMAND in config[CONF_TX] and CONF_COMMAND_FORMAT not in config:
         raise cv.Invalid(
-            "jandy_aqualink_rs profile requires tx.idle_command (typically 0x00) unless "
-            "sniffer_only is true; the AllButton emulator must ACK every probe or the "
-            "master will mark it offline"
+            "tx.idle_command requires a command_format: on the hub so the value has a "
+            "defined on-wire encoding"
         )
 
     return config
@@ -443,16 +355,10 @@ CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(RS485FrameHub),
-            cv.Optional(CONF_PROFILE, default=PROFILE_HAYWARD_WIRELESS): cv.one_of(
-                PROFILE_HAYWARD_WIRELESS,
-                PROFILE_HAYWARD_WIRED_REMOTE,
-                PROFILE_HAYWARD_WIRED_LOCAL,
-                PROFILE_JANDY_RS,
-                PROFILE_GENERIC,
-                lower=True,
-            ),
             cv.Optional(CONF_FRAMING, default={}): FRAMING_SCHEMA,
-            cv.Optional(CONF_CRC, default={}): CRC_SCHEMA,
+            # crc: is required because crc.type has no sensible cross-bus default; the user
+            # must declare their device's checksum (or `type: none`).
+            cv.Required(CONF_CRC): CRC_SCHEMA,
             cv.Optional(CONF_TX, default={}): TX_SCHEMA,
             cv.Optional(CONF_COMMAND_FORMAT): COMMAND_FORMAT_SCHEMA,
             cv.Optional(CONF_DUMP_FRAMES, default=False): cv.boolean,
@@ -479,50 +385,6 @@ CONFIG_SCHEMA = cv.All(
 )
 
 
-def _final_validate(config):
-    profile = config[CONF_PROFILE]
-    if profile == PROFILE_GENERIC:
-        return config
-
-    full_config = fv.full_config.get()
-    uart_path = full_config.get_path_for_id(config[CONF_UART_ID])[:-1]
-    uart_config = full_config.get_config_for_path(uart_path)
-
-    if profile == PROFILE_JANDY_RS:
-        required = {
-            CONF_BAUD_RATE: 9600,
-            CONF_DATA_BITS: 8,
-            CONF_PARITY: "NONE",
-            CONF_STOP_BITS: 1,
-        }
-        for key, expected in required.items():
-            # UART schema provides validated defaults for all four keys (baud_rate is
-            # required; the rest default in UART_DEVICE_SCHEMA).
-            if uart_config.get(key) != expected:
-                raise cv.Invalid(
-                    f"RS485 Frame jandy_aqualink_rs profile requires uart {key}: {expected}; "
-                    f"use profile: {PROFILE_GENERIC} for other serial settings"
-                )
-        return config
-
-    required = {
-        CONF_BAUD_RATE: 19200,
-        CONF_DATA_BITS: 8,
-        CONF_PARITY: "NONE",
-        CONF_STOP_BITS: 2,
-    }
-    for key, expected in required.items():
-        if uart_config.get(key) != expected:
-            raise cv.Invalid(
-                f"RS485 Frame Hayward profiles require uart {key}: {expected}; "
-                f"use profile: {PROFILE_GENERIC} for other serial settings"
-            )
-    return config
-
-
-FINAL_VALIDATE_SCHEMA = _final_validate
-
-
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
@@ -546,8 +408,11 @@ async def to_code(config):
 
     tx = config[CONF_TX]
     gate = tx[CONF_GATE]
+    # gate.frame_type is absent for idle_gap / fixed_delay modes (validate_hub only requires
+    # it for frame_trigger); default to an empty list so the hub's gate matcher never fires.
+    gate_frame_type = gate.get(CONF_FRAME_TYPE, [])
     cg.add(var.set_tx_gate_mode(TX_GATE_MODES[gate[CONF_MODE]]))
-    cg.add(var.set_tx_gate_frame_type(gate[CONF_FRAME_TYPE]))
+    cg.add(var.set_tx_gate_frame_type(gate_frame_type))
     cg.add(var.set_tx_gate_delay(gate[CONF_DELAY].total_milliseconds))
     cg.add(var.set_tx_idle_gap(gate[CONF_MIN_SILENCE].total_milliseconds))
     cg.add(var.set_tx_fixed_interval(gate[CONF_INTERVAL].total_milliseconds))
@@ -556,9 +421,9 @@ async def to_code(config):
     if (idle_cmd := tx.get(CONF_IDLE_COMMAND)) is not None:
         cg.add(var.set_idle_command(idle_cmd))
 
-    # command_format is only present when the profile supplies a default or the user set it
-    # explicitly. profile: generic_rs485_frame deliberately leaves it unset — the button
-    # platform's _final_validate rejects `command:` against a hub with no command_format.
+    # command_format is only present when the user set it explicitly. Hubs without it can
+    # still transmit via the raw button form or rs485_frame.send_frame — the button
+    # platform's _final_validate rejects the `command:` shorthand against such a hub.
     if (cf := config.get(CONF_COMMAND_FORMAT)) is not None:
         cg.add(
             var.set_command_format(
@@ -578,7 +443,9 @@ async def to_code(config):
         # cg.add_define gates the SnifferStats field, includes, and hot-path call out of
         # builds that don't use sniffer_stats — production firmware pays no cost at all.
         cg.add_define("USE_RS485_FRAME_SNIFFER_STATS")
-        ref = stats.get(CONF_REFERENCE_FRAME_TYPE, gate[CONF_FRAME_TYPE])
+        # reference_frame_type defaults to the gate frame_type (may be empty for non
+        # frame_trigger modes); the sniffer treats an empty reference as "no cadence ref".
+        ref = stats.get(CONF_REFERENCE_FRAME_TYPE, gate_frame_type)
         cg.add(
             var.enable_sniffer_stats(
                 stats[CONF_MAX_FRAME_TYPES],
@@ -614,10 +481,9 @@ async def to_code(config):
 # and payload are templatable lists of bytes so callers can compute them at action time
 # (e.g. from a trigger's payload, a global, or a sensor reading). The hub takes care of
 # DLE-framing, byte-stuffing, and CRC according to the hub's crc.type and crc.tx_variant.
-# This is the primary transmit path for generic_rs485_frame (no key_format machinery
-# involved) and a flexible escape hatch for Hayward/Jandy profiles that need to send
-# something the built-in key formats don't cover (probe frames, vendor-specific commands,
-# device-discovery sequences, etc.).
+# This is the most flexible transmit path: it needs no command_format on the hub and can
+# emit anything (probe frames, vendor-specific commands, device-discovery sequences, or a
+# value computed at runtime) that the `command:` button shorthand cannot express.
 SEND_FRAME_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.use_id(RS485FrameHub),
