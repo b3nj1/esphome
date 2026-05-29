@@ -321,7 +321,7 @@ def validate_hub(config):
 
     # In frame_trigger gate mode (non-sniffer), the gate frame type must be a non-empty byte
     # list — otherwise the gate would never fire and queued commands would accumulate
-    # forever. There is no profile default to fall back on, so require it explicitly.
+    # forever. It has no default, so require it explicitly.
     if (
         gate_mode == "frame_trigger"
         and not gate.get(CONF_FRAME_TYPE)

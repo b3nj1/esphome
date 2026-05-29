@@ -8,7 +8,7 @@ globals:
 
 rs485_frame:
   # Hub 1 — exercises on_frame: triggers + diagnostic sensors + button + number.
-  # crc: is required (there are no profile defaults). command_format: is set explicitly so
+  # crc: is required (it has no default). command_format: is set explicitly so
   # the `command:`-form button below is accepted (the button platform's _final_validate
   # rejects `command:` against a hub with no command_format). The default frame_trigger gate
   # mode requires an explicit gate.frame_type. A representative non-trivial command_format:

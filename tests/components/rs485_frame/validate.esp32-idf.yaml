@@ -1,7 +1,7 @@
 ## Config-only validation tests for validate_hub() branches and the button platform's
 ## _final_validate, which the compiled common.yaml does not all reach. CI runs this with
 ## `esphome config` only; it is never compiled, so it uses the shared UART package like the
-## compiled tests (no profile-specific UART settings to enforce anymore).
+## compiled tests.
 
 packages:
   uart: !include ../../test_build_components/common/uart/esp32-idf.yaml
