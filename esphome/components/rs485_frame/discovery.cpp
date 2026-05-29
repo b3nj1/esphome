@@ -211,6 +211,9 @@ void RS485FrameDiscovery::analyze_burst_() {
   if (len < 4)
     return;
 
+  // Framing-byte candidates from the burst's first and last byte pairs. Even a burst that holds
+  // several back-to-back frames opens with the first frame's DLE+STX and closes with the last
+  // frame's DLE+ETX, so these pairs still vote for the right delimiters.
   this->bump_pair_(this->start_pairs_, this->start_pairs_len_, b[0], b[1]);
   this->bump_pair_(this->end_pairs_, this->end_pairs_len_, b[len - 2], b[len - 1]);
 
@@ -238,16 +241,60 @@ void RS485FrameDiscovery::analyze_burst_() {
     this->scored_marker_ = 0;
   }
 
-  // Histogram the byte following each interior DLE. Range stops at len-4 so the successor index
-  // (i+1) stays inside the interior and never reaches the closing DLE+ETX terminator.
-  for (size_t i = 2; i + 1 <= len - 3; i++) {
+  // Split the burst into individual frames. A burst can hold several frames when they arrive
+  // back-to-back faster than idle_gap, so escape/CRC analysis must run per frame, not per burst:
+  // treating a multi-frame burst as one frame both pollutes the escape histogram with the
+  // DLE+STX / DLE+ETX bytes at internal frame boundaries and makes every CRC check span two
+  // frames (so none match). Inside a frame a DLE not followed by ETX is an escape and consumes
+  // the next byte, so an embedded DLE+marker never falsely terminates the frame (the only
+  // requirement is marker != ETX, which always holds in practice).
+  size_t i = 0;
+  while (i + 1 < len) {
+    if (b[i] != dle || b[i + 1] != stx) {
+      i++;
+      continue;
+    }
+    const size_t inner_start = i + 2;
+    size_t j = inner_start;
+    size_t frame_end = SIZE_MAX;  // index of the closing DLE, once found
+    while (j + 1 < len) {
+      if (b[j] == dle) {
+        if (b[j + 1] == etx) {
+          frame_end = j;
+          break;
+        }
+        j += 2;  // escape: skip the marker/literal byte
+      } else {
+        j++;
+      }
+    }
+    if (frame_end == SIZE_MAX)
+      break;  // trailing partial frame with no terminator; stop scanning this burst
+    this->analyze_frame_(b, inner_start, frame_end, dle, stx, etx);
+    i = frame_end + 2;  // resume past the closing DLE+ETX
+  }
+}
+
+void RS485FrameDiscovery::analyze_frame_(const std::vector<uint8_t> &b, size_t inner_start, size_t frame_end,
+                                         uint8_t dle, uint8_t stx, uint8_t etx) {
+  (void) stx;
+  (void) etx;
+  this->total_frames_++;
+
+  // Escape histogram: within a single frame's interior every DLE is an escape, so the following
+  // byte is the escape marker. Advance by two on a hit so a doubled DLE (double mode) is counted
+  // once, not twice.
+  for (size_t i = inner_start; i + 1 < frame_end;) {
     if (b[i] == dle) {
       this->dle_succ_hist_[b[i + 1]]++;
       this->dle_succ_total_++;
+      i += 2;
+    } else {
+      i++;
     }
   }
 
-  // Classify the escape marker once enough interior DLEs have been seen.
+  // (Re)classify the escape marker once enough interior DLEs have been seen.
   if (this->dle_succ_total_ >= MIN_DLE_SUCC) {
     uint16_t arg = 0;
     for (uint16_t v = 1; v < 256; v++) {
@@ -263,13 +310,11 @@ void RS485FrameDiscovery::analyze_burst_() {
     }
   }
 
-  // Only score CRC against frames that match the current opening/closing candidate.
-  if (len < 6 || b[0] != dle || b[1] != stx || b[len - 2] != dle || b[len - 1] != etx)
+  if (frame_end <= inner_start)
     return;
-  this->framed_bursts_++;
 
   // raw_inner_ = the on-wire bytes strictly between the opening STX and the closing DLE.
-  this->raw_inner_.assign(b.begin() + 2, b.end() - 2);
+  this->raw_inner_.assign(b.begin() + inner_start, b.begin() + frame_end);
 
   // unescaped_ = raw_inner_ with DLE byte-stuffing removed, using the detected marker. With no
   // confirmed marker yet, unescaping is the identity (and equals the raw view).
@@ -293,8 +338,8 @@ void RS485FrameDiscovery::analyze_burst_() {
 }
 
 void RS485FrameDiscovery::report_() {
-  ESP_LOGI(TAG, "RS485 discovery (cumulative since boot): %" PRIu32 " bursts, %" PRIu32 " matched framing candidate",
-           this->total_bursts_, this->framed_bursts_);
+  ESP_LOGI(TAG, "RS485 discovery (cumulative since boot): %" PRIu32 " bursts, %" PRIu32 " frames extracted",
+           this->total_bursts_, this->total_frames_);
 
   if (this->total_bursts_ < MIN_BURSTS_TO_REPORT) {
     ESP_LOGI(TAG, "  Collecting traffic - need at least %" PRIu32 " bursts before suggesting candidates",
@@ -370,13 +415,15 @@ void RS485FrameDiscovery::report_() {
   }
 
   // Ready-to-paste config suggestion (only when the framing delimiters are coherent).
-  if (dle_agrees && escape_known) {
+  if (dle_agrees) {
     ESP_LOGI(TAG, "  Suggested framing/escape config:");
     ESP_LOGI(TAG, "    framing:");
     ESP_LOGI(TAG, "      dle: 0x%02x", top_start->a);
     ESP_LOGI(TAG, "      stx: 0x%02x", top_start->b);
     ESP_LOGI(TAG, "      etx: 0x%02x", top_end->b);
-    if (escape_double) {
+    if (!escape_known) {
+      ESP_LOGI(TAG, "      # escape: unconfirmed - no DLE seen inside a payload yet; capture more traffic");
+    } else if (escape_double) {
       ESP_LOGI(TAG, "      escape: {mode: double}");
     } else {
       ESP_LOGI(TAG, "      escape: {mode: escape_byte, byte: 0x%02x}", escape_marker);
