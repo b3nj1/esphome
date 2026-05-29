@@ -133,6 +133,15 @@ rs485_frame:
         min_silence: 20ms
       idle_command: 0x00
 
+  # Hub 5 — discovery mode: no framing/crc/escape declared (those are what it discovers). The
+  # hub bypasses framing/validation/TX and passively analyzes raw traffic. Compiles the
+  # USE_RS485_FRAME_DISCOVERY code path in CI.
+  - id: rs485_frame_hub5
+    uart_id: uart_bus
+    discovery:
+      interval: 15s
+      idle_gap: 4ms
+
 binary_sensor:
   # User RX decoding is done entirely through on_frame: + template sensors.
   - platform: template

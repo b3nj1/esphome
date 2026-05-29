@@ -9,6 +9,9 @@
 #ifdef USE_RS485_FRAME_SNIFFER_STATS
 #include "sniffer_stats.h"
 #endif
+#ifdef USE_RS485_FRAME_DISCOVERY
+#include "discovery.h"
+#endif
 
 #include <memory>
 #include <vector>
@@ -174,6 +177,14 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   }
 #endif
 
+#ifdef USE_RS485_FRAME_DISCOVERY
+  // Owns the discovery analyzer. Called once from to_code when discovery: is present. With
+  // discovery active the hub bypasses framing/validation/TX entirely (see loop()).
+  void enable_discovery(uint32_t interval_ms, uint32_t idle_gap_ms, size_t max_burst) {
+    this->discovery_ = std::make_unique<RS485FrameDiscovery>(interval_ms, idle_gap_ms, max_burst);
+  }
+#endif
+
   bool queue_command_value(uint32_t command);
   bool queue_raw_frame(const std::vector<uint8_t> &payload);
   // Assemble frame_type + payload into a pre-reserved buffer and queue it. Used by the
@@ -318,6 +329,12 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   // nullptr unless sniffer_stats: was present in YAML. The hot path is a single null check
   // in process_raw_frame_; production builds (without the define) pay no cost at all.
   std::unique_ptr<SnifferStats> sniffer_stats_;
+#endif
+
+#ifdef USE_RS485_FRAME_DISCOVERY
+  // nullptr unless discovery: was present in YAML. When set, loop() routes raw bytes here and
+  // skips framing/validation/TX entirely. Production builds (without the define) pay no cost.
+  std::unique_ptr<RS485FrameDiscovery> discovery_;
 #endif
 };
 

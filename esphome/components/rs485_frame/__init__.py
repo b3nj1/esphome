@@ -4,6 +4,7 @@ from esphome.components import uart
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_DELAY,
+    CONF_DISCOVERY,
     CONF_ID,
     CONF_INTERVAL,
     CONF_MODE,
@@ -45,6 +46,7 @@ CONF_DUMP_FRAMES = "dump_frames"
 CONF_ESCAPE = "escape"
 CONF_BYTE = "byte"
 CONF_ETX = "etx"
+CONF_IDLE_GAP = "idle_gap"
 CONF_FRAME_TIMEOUT = "frame_timeout"
 CONF_FRAME_TYPE = "frame_type"
 CONF_FRAMING = "framing"
@@ -216,12 +218,14 @@ ESCAPE_SCHEMA = cv.Schema(
     }
 )
 
+# escape is optional at the schema level so a discovery: hub (which does not yet know the
+# scheme) need not declare it. validate_hub() requires it for every non-discovery hub.
 FRAMING_SCHEMA = cv.Schema(
     {
         cv.Optional(CONF_DLE, default=0x10): validate_byte,
         cv.Optional(CONF_STX, default=0x02): validate_byte,
         cv.Optional(CONF_ETX, default=0x03): validate_byte,
-        cv.Required(CONF_ESCAPE): _validate_escape,
+        cv.Optional(CONF_ESCAPE): _validate_escape,
     }
 )
 
@@ -332,6 +336,22 @@ SNIFFER_STATS_SCHEMA = cv.Schema(
 )
 
 
+# Schema for discovery: — a passive framing/CRC reverse-engineering aid for an unknown bus.
+# When present the hub does no framing, validation, or transmission; it captures raw bytes,
+# segments them by idle gap, and logs candidate framing bytes, escape scheme, and CRC scheme.
+# Compiled out unless the block is present (see USE_RS485_FRAME_DISCOVERY in discovery.h).
+DISCOVERY_SCHEMA = cv.Schema(
+    {
+        cv.Optional(CONF_INTERVAL, default="30s"): cv.positive_time_period_milliseconds,
+        # Idle time that ends a burst (frame). The classic rule of thumb is ~3 character times;
+        # 5ms covers 9600-19200 baud and stays above the loop cadence so frames are not split.
+        # The segmenter resolves gaps only at loop granularity, so very tightly packed frames
+        # may merge — raise this only if bursts are being split mid-frame.
+        cv.Optional(CONF_IDLE_GAP, default="5ms"): cv.positive_time_period_milliseconds,
+    }
+)
+
+
 def validate_hub(config):
     # Framing-byte distinctness. The framer uses DLE as the escape introducer: in-frame,
     # DLE+STX starts a frame, DLE+ETX ends it, and DLE+escape_byte is a literal DLE. If any
@@ -341,19 +361,43 @@ def validate_hub(config):
     dle = framing[CONF_DLE]
     stx = framing[CONF_STX]
     etx = framing[CONF_ETX]
-    escape = framing[CONF_ESCAPE]
     if len({int(dle), int(stx), int(etx)}) != 3:
         raise cv.Invalid("framing dle, stx and etx must all be distinct byte values")
     # In escape_byte mode the marker must differ from stx/etx, otherwise an escaped DLE is
     # indistinguishable from a frame start/end terminator. In double mode the marker is the
     # DLE itself, which is already distinct from stx/etx by the check above.
-    if escape[CONF_MODE] == ESCAPE_MODE_BYTE and int(escape[CONF_BYTE]) in (
-        int(stx),
-        int(etx),
+    if (
+        (escape := framing.get(CONF_ESCAPE)) is not None
+        and escape[CONF_MODE] == ESCAPE_MODE_BYTE
+        and int(escape[CONF_BYTE]) in (int(stx), int(etx))
     ):
         raise cv.Invalid(
             "framing.escape.byte must differ from stx and etx; otherwise an escaped DLE "
             "is indistinguishable from a frame start/end terminator"
+        )
+
+    # discovery: turns the hub into a passive analyzer — no framing, CRC, or TX. The framing
+    # escape scheme and crc: are exactly what it is trying to discover, so they are not required
+    # (and the gate/idle_command rules below do not apply). sniffer_stats: needs the validated
+    # frame path that discovery bypasses, so the two cannot be combined.
+    if CONF_DISCOVERY in config:
+        if CONF_SNIFFER_STATS in config:
+            raise cv.Invalid(
+                "discovery: cannot be combined with sniffer_stats: — discovery bypasses the "
+                "framing/validation path that sniffer_stats: records from"
+            )
+        return config
+
+    # Non-discovery hubs must declare the framing escape scheme and a crc: block.
+    if CONF_ESCAPE not in framing:
+        raise cv.Invalid(
+            "framing.escape is required (set framing.escape.mode to escape_byte or double); "
+            "it has no default. Omit it only on a discovery: hub"
+        )
+    if CONF_CRC not in config:
+        raise cv.Invalid(
+            "crc: is required (declare your device's checksum, or type: none). Omit it only "
+            "on a discovery: hub"
         )
 
     gate = config[CONF_TX][CONF_GATE]
@@ -397,9 +441,11 @@ CONFIG_SCHEMA = cv.All(
         {
             cv.GenerateID(): cv.declare_id(RS485FrameHub),
             cv.Optional(CONF_FRAMING, default={}): FRAMING_SCHEMA,
-            # crc: is required because crc.type has no sensible cross-bus default; the user
-            # must declare their device's checksum (or `type: none`).
-            cv.Required(CONF_CRC): CRC_SCHEMA,
+            # crc.type has no sensible cross-bus default, so validate_hub() requires this block
+            # for every non-discovery hub (a discovery: hub is trying to discover the CRC and
+            # so does not need it). Optional here, enforced there.
+            cv.Optional(CONF_CRC): CRC_SCHEMA,
+            cv.Optional(CONF_DISCOVERY): DISCOVERY_SCHEMA,
             cv.Optional(CONF_TX, default={}): TX_SCHEMA,
             cv.Optional(CONF_COMMAND_FORMAT): COMMAND_FORMAT_SCHEMA,
             cv.Optional(CONF_DUMP_FRAMES, default=False): cv.boolean,
@@ -432,28 +478,30 @@ async def to_code(config):
     await uart.register_uart_device(var, config)
 
     framing = config[CONF_FRAMING]
-    escape = framing[CONF_ESCAPE]
-    # The runtime tracks a single escape marker byte: in double mode a literal DLE is stuffed
-    # as DLE DLE, so the marker is the DLE byte itself; in escape_byte mode it is the declared
-    # byte. Resolving it here keeps the C++ framer/encoder a single unified code path.
-    if escape[CONF_MODE] == ESCAPE_MODE_DOUBLE:
-        escape_marker = framing[CONF_DLE]
-    else:
-        escape_marker = escape[CONF_BYTE]
-    cg.add(
-        var.set_framing(
-            framing[CONF_DLE],
-            framing[CONF_STX],
-            framing[CONF_ETX],
-            escape_marker,
+    # escape is absent only on a discovery: hub (validate_hub requires it otherwise). When
+    # present, the runtime tracks a single escape marker byte: in double mode a literal DLE is
+    # stuffed as DLE DLE, so the marker is the DLE byte itself; in escape_byte mode it is the
+    # declared byte. Resolving it here keeps the C++ framer/encoder a single unified code path.
+    if (escape := framing.get(CONF_ESCAPE)) is not None:
+        if escape[CONF_MODE] == ESCAPE_MODE_DOUBLE:
+            escape_marker = framing[CONF_DLE]
+        else:
+            escape_marker = escape[CONF_BYTE]
+        cg.add(
+            var.set_framing(
+                framing[CONF_DLE],
+                framing[CONF_STX],
+                framing[CONF_ETX],
+                escape_marker,
+            )
         )
-    )
 
-    crc = config[CONF_CRC]
-    cg.add(var.set_crc_type(CRC_TYPES[crc[CONF_TYPE]]))
-    cg.add(var.set_accept_header_crc("header_inclusive" in crc[CONF_RX_ACCEPT]))
-    cg.add(var.set_accept_payload_crc("payload_only" in crc[CONF_RX_ACCEPT]))
-    cg.add(var.set_tx_crc_variant(CRC_VARIANTS[crc[CONF_TX_VARIANT]]))
+    # crc is absent only on a discovery: hub.
+    if (crc := config.get(CONF_CRC)) is not None:
+        cg.add(var.set_crc_type(CRC_TYPES[crc[CONF_TYPE]]))
+        cg.add(var.set_accept_header_crc("header_inclusive" in crc[CONF_RX_ACCEPT]))
+        cg.add(var.set_accept_payload_crc("payload_only" in crc[CONF_RX_ACCEPT]))
+        cg.add(var.set_tx_crc_variant(CRC_VARIANTS[crc[CONF_TX_VARIANT]]))
 
     tx = config[CONF_TX]
     gate = tx[CONF_GATE]
@@ -503,6 +551,18 @@ async def to_code(config):
                 stats[CONF_MAX_UNIQUE_PAYLOADS],
                 stats[CONF_PAYLOAD_CAPTURE_BYTES],
                 ref,
+            )
+        )
+
+    if (disc := config.get(CONF_DISCOVERY)) is not None:
+        # Gates the discovery field, includes, and the loop() bypass out of builds that don't
+        # use it. The burst buffer is capped at max_frame_length so long frames still fit.
+        cg.add_define("USE_RS485_FRAME_DISCOVERY")
+        cg.add(
+            var.enable_discovery(
+                disc[CONF_INTERVAL].total_milliseconds,
+                disc[CONF_IDLE_GAP].total_milliseconds,
+                config[CONF_MAX_FRAME_LENGTH],
             )
         )
 

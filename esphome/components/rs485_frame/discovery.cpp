@@ -1,0 +1,389 @@
+#include "discovery.h"
+
+#ifdef USE_RS485_FRAME_DISCOVERY
+
+#include "esphome/core/log.h"
+
+#include <cinttypes>
+
+namespace esphome::rs485_frame {
+
+static const char *const TAG = "rs485_frame.discovery";
+
+// A candidate frame must have at least this many bursts behind it before the report stops
+// saying "collecting" and prints candidates.
+static const uint32_t MIN_BURSTS_TO_REPORT = 5;
+// Interior-DLE observations required before classifying the escape scheme.
+static const uint32_t MIN_DLE_SUCC = 4;
+// Cross-frame agreement required to trust a CRC scheme, by CRC width. A 1-byte checksum
+// matches a wrong scheme 1/256 of the time per frame, so it needs many more samples than a
+// 2-byte CRC before a consistent match is meaningful.
+static const uint32_t MIN_CRC_SAMPLES_W1 = 20;
+static const uint32_t MIN_CRC_SAMPLES_W2 = 8;
+
+enum CrcAlgo : uint8_t { ALGO_SUM8, ALGO_XOR8, ALGO_SUM16, ALGO_MODBUS };
+
+struct CrcHypDef {
+  CrcAlgo algo;
+  uint8_t width;
+  bool header;      // true = CRC covers DLE+STX header, false = payload only
+  bool big_endian;  // only meaningful for width == 2
+};
+
+// Order must match RS485FrameDiscovery::NUM_CRC_HYPS.
+static const CrcHypDef CRC_HYPS[] = {
+    {ALGO_SUM8, 1, true, false},   {ALGO_SUM8, 1, false, false},  {ALGO_XOR8, 1, true, false},
+    {ALGO_XOR8, 1, false, false},  {ALGO_SUM16, 2, true, true},   {ALGO_SUM16, 2, true, false},
+    {ALGO_SUM16, 2, false, true},  {ALGO_SUM16, 2, false, false}, {ALGO_MODBUS, 2, true, true},
+    {ALGO_MODBUS, 2, true, false}, {ALGO_MODBUS, 2, false, true}, {ALGO_MODBUS, 2, false, false},
+};
+
+static const char *algo_name(CrcAlgo a) {
+  switch (a) {
+    case ALGO_SUM8:
+      return "sum8";
+    case ALGO_XOR8:
+      return "xor8";
+    case ALGO_SUM16:
+      return "sum16";
+    case ALGO_MODBUS:
+      return "crc16_modbus";
+    default:
+      return "?";
+  }
+}
+
+static uint32_t disc_sum(const uint8_t *d, size_t n, bool hdr, uint8_t dle, uint8_t stx) {
+  uint32_t s = hdr ? static_cast<uint32_t>(dle) + stx : 0;
+  for (size_t i = 0; i < n; i++)
+    s += d[i];
+  return s;
+}
+
+static uint8_t disc_xor8(const uint8_t *d, size_t n, bool hdr, uint8_t dle, uint8_t stx) {
+  uint8_t x = hdr ? static_cast<uint8_t>(dle ^ stx) : 0;
+  for (size_t i = 0; i < n; i++)
+    x ^= d[i];
+  return x;
+}
+
+static uint16_t disc_modbus(const uint8_t *d, size_t n, bool hdr, uint8_t dle, uint8_t stx) {
+  uint16_t c = 0xFFFF;
+  auto process = [&c](uint8_t b) {
+    c ^= b;
+    for (int k = 0; k < 8; k++)
+      c = (c & 0x0001) ? static_cast<uint16_t>((c >> 1) ^ 0xA001) : static_cast<uint16_t>(c >> 1);
+  };
+  if (hdr) {
+    process(dle);
+    process(stx);
+  }
+  for (size_t i = 0; i < n; i++)
+    process(d[i]);
+  return c;
+}
+
+void RS485FrameDiscovery::setup() {
+  this->burst_.reserve(this->max_burst_);
+  this->unescaped_.reserve(this->max_burst_);
+  this->raw_inner_.reserve(this->max_burst_);
+}
+
+void RS485FrameDiscovery::feed_byte(uint8_t b, uint32_t now) {
+  this->last_byte_time_ = now;
+  this->burst_open_ = true;
+  if (this->burst_.size() >= this->max_burst_) {
+    // Overflow: likely two frames merged across an undetected gap, or not a framed bus. Stop
+    // accumulating and let the idle-gap close the (truncated) burst rather than splitting at
+    // an arbitrary offset.
+    this->burst_truncated_ = true;
+    return;
+  }
+  this->burst_.push_back(b);
+}
+
+void RS485FrameDiscovery::tick(uint32_t now) {
+  if (!this->report_primed_) {
+    this->last_report_time_ = now;
+    this->report_primed_ = true;
+  }
+  if (this->burst_open_ && now - this->last_byte_time_ >= this->idle_gap_ms_)
+    this->close_burst_(now);
+  if (now - this->last_report_time_ >= this->report_interval_ms_) {
+    this->report_();
+    this->last_report_time_ = now;
+  }
+}
+
+void RS485FrameDiscovery::close_burst_(uint32_t /*now*/) {
+  if (this->burst_.size() >= 2 && !this->burst_truncated_)
+    this->analyze_burst_();
+  this->burst_.clear();
+  this->burst_open_ = false;
+  this->burst_truncated_ = false;
+}
+
+void RS485FrameDiscovery::bump_pair_(BytePair *table, size_t &len, uint8_t a, uint8_t b) {
+  for (size_t i = 0; i < len; i++) {
+    if (table[i].a == a && table[i].b == b) {
+      table[i].count++;
+      return;
+    }
+  }
+  if (len < PAIR_TABLE_SIZE) {
+    table[len++] = {a, b, 1};
+    return;
+  }
+  // Table full: replace the current minimum (heavy-hitters approximation). A genuinely common
+  // pair quickly re-accumulates; transient noise pairs churn through the low-count slots.
+  size_t min_i = 0;
+  for (size_t i = 1; i < len; i++) {
+    if (table[i].count < table[min_i].count)
+      min_i = i;
+  }
+  table[min_i] = {a, b, 1};
+}
+
+const RS485FrameDiscovery::BytePair *RS485FrameDiscovery::top_pair_(const BytePair *table, size_t len) {
+  if (len == 0)
+    return nullptr;
+  const BytePair *top = &table[0];
+  for (size_t i = 1; i < len; i++) {
+    if (table[i].count > top->count)
+      top = &table[i];
+  }
+  return top;
+}
+
+void RS485FrameDiscovery::reset_scoring_() {
+  for (size_t v = 0; v < NUM_ESCAPE_VIEWS; v++) {
+    for (size_t h = 0; h < NUM_CRC_HYPS; h++) {
+      this->crc_samples_[v][h] = 0;
+      this->crc_matches_[v][h] = 0;
+    }
+  }
+}
+
+void RS485FrameDiscovery::score_crc_(const std::vector<uint8_t> &content, bool unescaped_view) {
+  const size_t view = unescaped_view ? 0 : 1;
+  const size_t n = content.size();
+  const uint8_t *d = content.data();
+  for (size_t h = 0; h < NUM_CRC_HYPS; h++) {
+    const CrcHypDef &hyp = CRC_HYPS[h];
+    // Need at least a 2-byte frame_type as payload plus the CRC width.
+    if (n < static_cast<size_t>(hyp.width) + 2)
+      continue;
+    const size_t payload_len = n - hyp.width;
+    uint32_t received = 0;
+    if (hyp.width == 1) {
+      received = d[payload_len];
+    } else if (hyp.big_endian) {
+      received = (static_cast<uint32_t>(d[payload_len]) << 8) | d[payload_len + 1];
+    } else {
+      received = d[payload_len] | (static_cast<uint32_t>(d[payload_len + 1]) << 8);
+    }
+    uint32_t computed;
+    switch (hyp.algo) {
+      case ALGO_SUM8:
+        computed = disc_sum(d, payload_len, hyp.header, this->scored_dle_, this->scored_stx_) & 0xFF;
+        break;
+      case ALGO_XOR8:
+        computed = disc_xor8(d, payload_len, hyp.header, this->scored_dle_, this->scored_stx_);
+        break;
+      case ALGO_SUM16:
+        computed = disc_sum(d, payload_len, hyp.header, this->scored_dle_, this->scored_stx_) & 0xFFFF;
+        break;
+      case ALGO_MODBUS:
+      default:
+        computed = disc_modbus(d, payload_len, hyp.header, this->scored_dle_, this->scored_stx_);
+        break;
+    }
+    this->crc_samples_[view][h]++;
+    if (computed == received)
+      this->crc_matches_[view][h]++;
+  }
+}
+
+void RS485FrameDiscovery::analyze_burst_() {
+  this->total_bursts_++;
+  const std::vector<uint8_t> &b = this->burst_;
+  const size_t len = b.size();
+  if (len < 4)
+    return;
+
+  this->bump_pair_(this->start_pairs_, this->start_pairs_len_, b[0], b[1]);
+  this->bump_pair_(this->end_pairs_, this->end_pairs_len_, b[len - 2], b[len - 1]);
+
+  const BytePair *top_start = top_pair_(this->start_pairs_, this->start_pairs_len_);
+  const BytePair *top_end = top_pair_(this->end_pairs_, this->end_pairs_len_);
+  if (top_start == nullptr || top_end == nullptr)
+    return;
+
+  const uint8_t dle = top_start->a;
+  const uint8_t stx = top_start->b;
+  const uint8_t etx = top_end->b;
+
+  // When the framing candidate shifts (typically only in the first few bursts), discard the
+  // escape histogram and CRC counters so they reflect a single consistent hypothesis.
+  if (!this->scored_valid_ || dle != this->scored_dle_ || stx != this->scored_stx_ || etx != this->scored_etx_) {
+    this->reset_scoring_();
+    for (uint32_t &slot : this->dle_succ_hist_)
+      slot = 0;
+    this->dle_succ_total_ = 0;
+    this->scored_dle_ = dle;
+    this->scored_stx_ = stx;
+    this->scored_etx_ = etx;
+    this->scored_valid_ = true;
+    this->scored_has_marker_ = false;
+    this->scored_marker_ = 0;
+  }
+
+  // Histogram the byte following each interior DLE. Range stops at len-4 so the successor index
+  // (i+1) stays inside the interior and never reaches the closing DLE+ETX terminator.
+  for (size_t i = 2; i + 1 <= len - 3; i++) {
+    if (b[i] == dle) {
+      this->dle_succ_hist_[b[i + 1]]++;
+      this->dle_succ_total_++;
+    }
+  }
+
+  // Classify the escape marker once enough interior DLEs have been seen.
+  if (this->dle_succ_total_ >= MIN_DLE_SUCC) {
+    uint16_t arg = 0;
+    for (uint16_t v = 1; v < 256; v++) {
+      if (this->dle_succ_hist_[v] > this->dle_succ_hist_[arg])
+        arg = v;
+    }
+    const uint8_t marker = static_cast<uint8_t>(arg);
+    if (!this->scored_has_marker_ || marker != this->scored_marker_) {
+      // The escape marker drives unescaping, so a change invalidates the CRC counters.
+      this->reset_scoring_();
+      this->scored_has_marker_ = true;
+      this->scored_marker_ = marker;
+    }
+  }
+
+  // Only score CRC against frames that match the current opening/closing candidate.
+  if (len < 6 || b[0] != dle || b[1] != stx || b[len - 2] != dle || b[len - 1] != etx)
+    return;
+  this->framed_bursts_++;
+
+  // raw_inner_ = the on-wire bytes strictly between the opening STX and the closing DLE.
+  this->raw_inner_.assign(b.begin() + 2, b.end() - 2);
+
+  // unescaped_ = raw_inner_ with DLE byte-stuffing removed, using the detected marker. With no
+  // confirmed marker yet, unescaping is the identity (and equals the raw view).
+  this->unescaped_.clear();
+  if (this->scored_has_marker_) {
+    for (size_t i = 0; i < this->raw_inner_.size(); i++) {
+      if (this->raw_inner_[i] == dle && i + 1 < this->raw_inner_.size() &&
+          this->raw_inner_[i + 1] == this->scored_marker_) {
+        this->unescaped_.push_back(dle);
+        i++;
+      } else {
+        this->unescaped_.push_back(this->raw_inner_[i]);
+      }
+    }
+  } else {
+    this->unescaped_ = this->raw_inner_;
+  }
+
+  this->score_crc_(this->unescaped_, true);
+  this->score_crc_(this->raw_inner_, false);
+}
+
+void RS485FrameDiscovery::report_() {
+  ESP_LOGI(TAG, "RS485 discovery (cumulative since boot): %" PRIu32 " bursts, %" PRIu32 " matched framing candidate",
+           this->total_bursts_, this->framed_bursts_);
+
+  if (this->total_bursts_ < MIN_BURSTS_TO_REPORT) {
+    ESP_LOGI(TAG, "  Collecting traffic - need at least %" PRIu32 " bursts before suggesting candidates",
+             MIN_BURSTS_TO_REPORT);
+    return;
+  }
+
+  const BytePair *top_start = top_pair_(this->start_pairs_, this->start_pairs_len_);
+  const BytePair *top_end = top_pair_(this->end_pairs_, this->end_pairs_len_);
+  if (top_start == nullptr || top_end == nullptr)
+    return;
+
+  const bool dle_agrees = top_start->a == top_end->a;
+  if (dle_agrees) {
+    ESP_LOGI(TAG, "  Framing: DLE=0x%02x STX=0x%02x ETX=0x%02x  (start pair x%" PRIu32 ", end pair x%" PRIu32 ")",
+             top_start->a, top_start->b, top_end->b, top_start->count, top_end->count);
+  } else {
+    ESP_LOGI(TAG, "  Framing AMBIGUOUS: start pair 0x%02x 0x%02x (x%" PRIu32 "), end pair 0x%02x 0x%02x (x%" PRIu32 ")",
+             top_start->a, top_start->b, top_start->count, top_end->a, top_end->b, top_end->count);
+    ESP_LOGI(TAG, "  The opening and closing delimiter byte disagree - this bus may not be DLE-framed.");
+  }
+
+  // Escape scheme.
+  bool escape_double = false;
+  uint8_t escape_marker = 0;
+  bool escape_known = false;
+  if (this->dle_succ_total_ >= MIN_DLE_SUCC) {
+    uint16_t arg = 0;
+    for (uint16_t v = 1; v < 256; v++) {
+      if (this->dle_succ_hist_[v] > this->dle_succ_hist_[arg])
+        arg = v;
+    }
+    escape_marker = static_cast<uint8_t>(arg);
+    escape_known = true;
+    const uint32_t pct = this->dle_succ_hist_[arg] * 100 / this->dle_succ_total_;
+    if (escape_marker == top_start->a) {
+      escape_double = true;
+      ESP_LOGI(TAG, "  Escape: double (DLE DLE) - %" PRIu32 "%% of %" PRIu32 " in-frame DLEs", pct,
+               this->dle_succ_total_);
+    } else {
+      ESP_LOGI(TAG, "  Escape: escape_byte 0x%02x - %" PRIu32 "%% of %" PRIu32 " in-frame DLEs", escape_marker, pct,
+               this->dle_succ_total_);
+    }
+  } else {
+    ESP_LOGI(TAG, "  Escape: unconfirmed - no in-frame DLE observed in %" PRIu32 " bursts. Capture longer / busier",
+             this->total_bursts_);
+  }
+
+  // CRC survivors.
+  bool any_crc = false;
+  const char *view_name[NUM_ESCAPE_VIEWS] = {"unescaped", "raw wire bytes"};
+  for (size_t v = 0; v < NUM_ESCAPE_VIEWS; v++) {
+    for (size_t h = 0; h < NUM_CRC_HYPS; h++) {
+      const CrcHypDef &hyp = CRC_HYPS[h];
+      const uint32_t need = hyp.width == 1 ? MIN_CRC_SAMPLES_W1 : MIN_CRC_SAMPLES_W2;
+      const uint32_t samples = this->crc_samples_[v][h];
+      if (samples >= need && this->crc_matches_[v][h] == samples) {
+        any_crc = true;
+        const char *cover = hyp.header ? "header_inclusive" : "payload_only";
+        if (hyp.width == 2) {
+          ESP_LOGI(TAG, "  CRC match: %s %s %s (%s) - %" PRIu32 "/%" PRIu32 " frames", algo_name(hyp.algo), cover,
+                   hyp.big_endian ? "big-endian" : "little-endian", view_name[v], this->crc_matches_[v][h], samples);
+        } else {
+          ESP_LOGI(TAG, "  CRC match: %s %s (%s) - %" PRIu32 "/%" PRIu32 " frames", algo_name(hyp.algo), cover,
+                   view_name[v], this->crc_matches_[v][h], samples);
+        }
+      }
+    }
+  }
+  if (!any_crc) {
+    ESP_LOGI(TAG, "  CRC: no scheme matched consistently yet - try crc: {type: none}, or the bus uses an "
+                  "unsupported check");
+  }
+
+  // Ready-to-paste config suggestion (only when the framing delimiters are coherent).
+  if (dle_agrees && escape_known) {
+    ESP_LOGI(TAG, "  Suggested framing/escape config:");
+    ESP_LOGI(TAG, "    framing:");
+    ESP_LOGI(TAG, "      dle: 0x%02x", top_start->a);
+    ESP_LOGI(TAG, "      stx: 0x%02x", top_start->b);
+    ESP_LOGI(TAG, "      etx: 0x%02x", top_end->b);
+    if (escape_double) {
+      ESP_LOGI(TAG, "      escape: {mode: double}");
+    } else {
+      ESP_LOGI(TAG, "      escape: {mode: escape_byte, byte: 0x%02x}", escape_marker);
+    }
+  }
+}
+
+}  // namespace esphome::rs485_frame
+
+#endif  // USE_RS485_FRAME_DISCOVERY

@@ -98,10 +98,28 @@ void RS485FrameHub::setup() {
   // Hex-text log buffer sized to the worst-case TX frame (2 hex chars per byte + NUL).
   this->hex_log_buf_size_ = tx_slot_capacity * 2 + 1;
   this->hex_log_buf_ = std::make_unique<char[]>(this->hex_log_buf_size_);
+
+#ifdef USE_RS485_FRAME_DISCOVERY
+  if (this->discovery_ != nullptr)
+    this->discovery_->setup();
+#endif
 }
 
 void RS485FrameHub::loop() {
   const uint32_t now = App.get_loop_component_start_time();
+
+#ifdef USE_RS485_FRAME_DISCOVERY
+  if (this->discovery_ != nullptr) {
+    // Discovery mode: capture raw bytes for analysis. No framing, no validation, no TX — the
+    // whole point is that the framing/CRC are not yet known.
+    uint8_t byte;
+    while (this->available() && this->read_byte(&byte))
+      this->discovery_->feed_byte(byte, now);
+    this->discovery_->tick(now);
+    return;
+  }
+#endif
+
   this->read_uart_(now);
 
   // Reset receive state if a partial frame has been sitting on the bus longer than the
@@ -161,6 +179,10 @@ void RS485FrameHub::dump_config() {
       YESNO(this->accept_payload_crc_), tx_gate_mode_str(this->tx_gate_mode_), gate_hex, this->tx_gate_delay_,
       this->tx_idle_gap_, this->tx_fixed_interval_, queue_policy_str(this->queue_policy_), this->max_queue_size_,
       this->max_frame_length_, this->in_frame_timeout_ms_, YESNO(this->sniffer_only_), YESNO(this->dump_frames_));
+#ifdef USE_RS485_FRAME_DISCOVERY
+  if (this->discovery_ != nullptr)
+    ESP_LOGCONFIG(TAG, "  Discovery: ENABLED (framing/CRC/TX bypassed; passively analyzing raw traffic)");
+#endif
 }
 
 void RS485FrameHub::set_framing(uint8_t dle, uint8_t stx, uint8_t etx, uint8_t escape_marker) {

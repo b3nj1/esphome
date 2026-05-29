@@ -82,6 +82,12 @@ rs485_frame:
         interval: 250ms
       idle_command: 0x00
 
+  # discovery hub: no framing.escape and no crc: required (those are what it discovers).
+  # Exercises the validate_hub early-return branch and the discovery: defaults.
+  - id: discover_hub
+    uart_id: uart_bus
+    discovery: {}
+
 # Buttons exercise both _final_validate branches:
 #   - command-form against a hub that has a command_format (cmd_hub)  -> accepted
 #   - raw form against a hub with no command_format (raw_hub)         -> accepted
