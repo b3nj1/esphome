@@ -11,6 +11,10 @@ rs485_frame:
   # so the `command:`-form button below is accepted.
   - id: cmd_hub
     uart_id: uart_bus
+    framing:
+      escape:
+        mode: escape_byte
+        byte: 0x00
     crc:
       type: sum16
       rx_accept: [header_inclusive, payload_only]
@@ -30,6 +34,10 @@ rs485_frame:
   - id: sniffer_hub
     uart_id: uart_bus
     sniffer_only: true
+    # double escape mode validated config-only here (no byte: key permitted).
+    framing:
+      escape:
+        mode: double
     crc:
       type: none
     tx:
@@ -46,7 +54,9 @@ rs485_frame:
       dle: 0x7D
       stx: 0x01
       etx: 0x04
-      escape_byte: 0x00
+      escape:
+        mode: escape_byte
+        byte: 0x00
     crc:
       type: xor8
     tx:
@@ -57,6 +67,10 @@ rs485_frame:
   # gate mode (no gate.frame_type needed).
   - id: idle_hub
     uart_id: uart_bus
+    framing:
+      escape:
+        mode: escape_byte
+        byte: 0x00
     crc:
       type: sum8
     command_format:

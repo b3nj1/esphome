@@ -123,7 +123,7 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
 
-  void set_framing(uint8_t dle, uint8_t stx, uint8_t etx, uint8_t escape_byte);
+  void set_framing(uint8_t dle, uint8_t stx, uint8_t etx, uint8_t escape_marker);
   void set_accept_header_crc(bool accept) { this->accept_header_crc_ = accept; }
   void set_accept_payload_crc(bool accept) { this->accept_payload_crc_ = accept; }
   void set_crc_type(CrcType type) { this->crc_type_ = type; }
@@ -220,7 +220,7 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   uint8_t dle_{0x10};
   uint8_t stx_{0x02};
   uint8_t etx_{0x03};
-  uint8_t escape_byte_{0x00};
+  uint8_t escape_marker_{0x00};
   bool accept_header_crc_{true};
   bool accept_payload_crc_{true};
   CrcType crc_type_{CRC_TYPE_SUM16};
@@ -263,6 +263,12 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
 
   bool in_frame_{false};
   uint8_t previous_byte_{0};
+  // True when the immediately preceding in-frame byte was an unescaped DLE whose meaning is
+  // still pending. The next byte resolves it: ETX terminates the frame, escape_marker_ marks
+  // a stuffed literal DLE, anything else is a protocol violation. Tracking this (rather than
+  // peeking at the previous raw byte) is required for doubling mode, where adjacent DLEs
+  // would otherwise be miscounted at frame boundaries.
+  bool after_dle_{false};
   std::vector<uint8_t> raw_frame_;
   uint32_t last_rx_time_{0};
   bool last_ka_seen_{false};

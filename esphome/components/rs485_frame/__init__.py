@@ -42,7 +42,8 @@ CONF_CRC = "crc"
 CONF_DECODE = "decode"
 CONF_DLE = "dle"
 CONF_DUMP_FRAMES = "dump_frames"
-CONF_ESCAPE_BYTE = "escape_byte"
+CONF_ESCAPE = "escape"
+CONF_BYTE = "byte"
 CONF_ETX = "etx"
 CONF_FRAME_TIMEOUT = "frame_timeout"
 CONF_FRAME_TYPE = "frame_type"
@@ -181,12 +182,46 @@ COMMAND_FORMAT_SCHEMA = cv.Schema(
 )
 
 
+# Two ways a literal DLE inside the payload (or CRC) is byte-stuffed on the wire. There is
+# no default: the wrong scheme silently corrupts every frame that happens to contain a DLE,
+# and which one a bus uses is not inferable, so the user must declare it (mode: escape_byte
+# is what Hayward uses; mode: double is the more common DLE-doubling convention).
+ESCAPE_MODE_BYTE = "escape_byte"
+ESCAPE_MODE_DOUBLE = "double"
+
+
+def _validate_escape(value):
+    value = ESCAPE_SCHEMA(value)
+    mode = value[CONF_MODE]
+    if mode == ESCAPE_MODE_BYTE and CONF_BYTE not in value:
+        raise cv.Invalid(
+            "framing.escape.byte is required when framing.escape.mode is escape_byte "
+            "(the byte emitted after a DLE to mark it as literal data, e.g. 0x00)"
+        )
+    if mode == ESCAPE_MODE_DOUBLE and CONF_BYTE in value:
+        raise cv.Invalid(
+            "framing.escape.byte must be omitted when framing.escape.mode is double "
+            "(a literal DLE is stuffed by doubling the DLE itself)"
+        )
+    return value
+
+
+ESCAPE_SCHEMA = cv.Schema(
+    {
+        # No default: escape mode is a foot-gun, like the framing bytes, so require it.
+        cv.Required(CONF_MODE): cv.one_of(
+            ESCAPE_MODE_BYTE, ESCAPE_MODE_DOUBLE, lower=True
+        ),
+        cv.Optional(CONF_BYTE): validate_byte,
+    }
+)
+
 FRAMING_SCHEMA = cv.Schema(
     {
         cv.Optional(CONF_DLE, default=0x10): validate_byte,
         cv.Optional(CONF_STX, default=0x02): validate_byte,
         cv.Optional(CONF_ETX, default=0x03): validate_byte,
-        cv.Optional(CONF_ESCAPE_BYTE, default=0x00): validate_byte,
+        cv.Required(CONF_ESCAPE): _validate_escape,
     }
 )
 
@@ -306,12 +341,18 @@ def validate_hub(config):
     dle = framing[CONF_DLE]
     stx = framing[CONF_STX]
     etx = framing[CONF_ETX]
-    escape = framing[CONF_ESCAPE_BYTE]
+    escape = framing[CONF_ESCAPE]
     if len({int(dle), int(stx), int(etx)}) != 3:
         raise cv.Invalid("framing dle, stx and etx must all be distinct byte values")
-    if int(escape) in (int(stx), int(etx)):
+    # In escape_byte mode the marker must differ from stx/etx, otherwise an escaped DLE is
+    # indistinguishable from a frame start/end terminator. In double mode the marker is the
+    # DLE itself, which is already distinct from stx/etx by the check above.
+    if escape[CONF_MODE] == ESCAPE_MODE_BYTE and int(escape[CONF_BYTE]) in (
+        int(stx),
+        int(etx),
+    ):
         raise cv.Invalid(
-            "framing escape_byte must differ from stx and etx; otherwise an escaped DLE "
+            "framing.escape.byte must differ from stx and etx; otherwise an escaped DLE "
             "is indistinguishable from a frame start/end terminator"
         )
 
@@ -391,12 +432,20 @@ async def to_code(config):
     await uart.register_uart_device(var, config)
 
     framing = config[CONF_FRAMING]
+    escape = framing[CONF_ESCAPE]
+    # The runtime tracks a single escape marker byte: in double mode a literal DLE is stuffed
+    # as DLE DLE, so the marker is the DLE byte itself; in escape_byte mode it is the declared
+    # byte. Resolving it here keeps the C++ framer/encoder a single unified code path.
+    if escape[CONF_MODE] == ESCAPE_MODE_DOUBLE:
+        escape_marker = framing[CONF_DLE]
+    else:
+        escape_marker = escape[CONF_BYTE]
     cg.add(
         var.set_framing(
             framing[CONF_DLE],
             framing[CONF_STX],
             framing[CONF_ETX],
-            framing[CONF_ESCAPE_BYTE],
+            escape_marker,
         )
     )
 

@@ -15,6 +15,10 @@ rs485_frame:
   # 3-byte preamble, 4-byte command x 2, 1-byte pad.
   - id: rs485_frame_hub
     uart_id: uart_bus
+    framing:
+      escape:
+        mode: escape_byte
+        byte: 0x00
     crc:
       type: sum16
     tx:
@@ -73,6 +77,11 @@ rs485_frame:
   - id: rs485_frame_hub2
     uart_id: uart_bus
     sniffer_only: true
+    # double escape mode: a literal DLE is stuffed by doubling it (DLE DLE) rather than with
+    # a separate escape byte. Exercises the doubling framer/encoder path in CI.
+    framing:
+      escape:
+        mode: double
     crc:
       type: crc16_modbus
       rx_accept: [header_inclusive, payload_only]
@@ -94,6 +103,10 @@ rs485_frame:
   # CRC, fixed_delay gate.
   - id: rs485_frame_hub3
     uart_id: uart_bus
+    framing:
+      escape:
+        mode: escape_byte
+        byte: 0x00
     crc:
       type: xor8
     tx:
@@ -106,6 +119,10 @@ rs485_frame:
   # used here. idle_gap gate so the keepalive is emitted after bus silence.
   - id: rs485_frame_hub4
     uart_id: uart_bus
+    framing:
+      escape:
+        mode: escape_byte
+        byte: 0x00
     crc:
       type: sum8
     command_format:

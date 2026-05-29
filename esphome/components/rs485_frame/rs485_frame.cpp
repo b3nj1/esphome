@@ -110,6 +110,7 @@ void RS485FrameHub::loop() {
   if (this->in_frame_ && this->in_frame_timeout_ms_ > 0 && now - this->last_rx_time_ >= this->in_frame_timeout_ms_) {
     ESP_LOGW(TAG, "Intra-frame timeout — resetting receive state");
     this->in_frame_ = false;
+    this->after_dle_ = false;
     this->raw_frame_.clear();
     // Reset previous_byte_ so a stale DLE before the timeout can't combine with the next STX
     // to spuriously start a new frame on the first byte received after recovery.
@@ -137,29 +138,36 @@ void RS485FrameHub::dump_config() {
   // StaticVector caps the size at MAX_FRAME_TYPE_LEN, so no run-time bound needed.
   char gate_hex[format_hex_size(MAX_FRAME_TYPE_LEN)];
   format_hex_to(gate_hex, this->tx_gate_frame_type_.data(), this->tx_gate_frame_type_.size());
+  // escape_marker_ == dle_ means doubling mode (a literal DLE is stuffed as DLE DLE);
+  // otherwise the marker is the dedicated escape byte emitted after a DLE.
+  char esc_desc[24];
+  if (this->escape_marker_ == this->dle_) {
+    snprintf(esc_desc, sizeof(esc_desc), "double (DLE DLE)");
+  } else {
+    snprintf(esc_desc, sizeof(esc_desc), "byte 0x%02x", this->escape_marker_);
+  }
   // Consolidated multi-line ESP_LOGCONFIG (matches modbus_server style) to save flash.
-  ESP_LOGCONFIG(TAG,
-                "RS485 Frame:\n"
-                "  Framing: DLE=0x%02x STX=0x%02x ETX=0x%02x ESC=0x%02x\n"
-                "  CRC type: %s, accept header CRC: %s, accept payload CRC: %s\n"
-                "  TX gate: %s, gate frame: %s, gate delay: %" PRIu32 "ms\n"
-                "  TX idle gap: %" PRIu32 "ms, TX interval: %" PRIu32 "ms\n"
-                "  Queue policy: %s, queue size: %" PRIu32 "\n"
-                "  Max frame length: %" PRIu32 ", frame timeout: %" PRIu32 "ms\n"
-                "  Sniffer only: %s, dump frames: %s",
-                this->dle_, this->stx_, this->etx_, this->escape_byte_, crc_type_str(this->crc_type_),
-                YESNO(this->accept_header_crc_), YESNO(this->accept_payload_crc_),
-                tx_gate_mode_str(this->tx_gate_mode_), gate_hex, this->tx_gate_delay_, this->tx_idle_gap_,
-                this->tx_fixed_interval_, queue_policy_str(this->queue_policy_), this->max_queue_size_,
-                this->max_frame_length_, this->in_frame_timeout_ms_, YESNO(this->sniffer_only_),
-                YESNO(this->dump_frames_));
+  ESP_LOGCONFIG(
+      TAG,
+      "RS485 Frame:\n"
+      "  Framing: DLE=0x%02x STX=0x%02x ETX=0x%02x, escape: %s\n"
+      "  CRC type: %s, accept header CRC: %s, accept payload CRC: %s\n"
+      "  TX gate: %s, gate frame: %s, gate delay: %" PRIu32 "ms\n"
+      "  TX idle gap: %" PRIu32 "ms, TX interval: %" PRIu32 "ms\n"
+      "  Queue policy: %s, queue size: %" PRIu32 "\n"
+      "  Max frame length: %" PRIu32 ", frame timeout: %" PRIu32 "ms\n"
+      "  Sniffer only: %s, dump frames: %s",
+      this->dle_, this->stx_, this->etx_, esc_desc, crc_type_str(this->crc_type_), YESNO(this->accept_header_crc_),
+      YESNO(this->accept_payload_crc_), tx_gate_mode_str(this->tx_gate_mode_), gate_hex, this->tx_gate_delay_,
+      this->tx_idle_gap_, this->tx_fixed_interval_, queue_policy_str(this->queue_policy_), this->max_queue_size_,
+      this->max_frame_length_, this->in_frame_timeout_ms_, YESNO(this->sniffer_only_), YESNO(this->dump_frames_));
 }
 
-void RS485FrameHub::set_framing(uint8_t dle, uint8_t stx, uint8_t etx, uint8_t escape_byte) {
+void RS485FrameHub::set_framing(uint8_t dle, uint8_t stx, uint8_t etx, uint8_t escape_marker) {
   this->dle_ = dle;
   this->stx_ = stx;
   this->etx_ = etx;
-  this->escape_byte_ = escape_byte;
+  this->escape_marker_ = escape_marker;
 }
 
 bool RS485FrameHub::queue_command_value(uint32_t command) {
@@ -221,6 +229,7 @@ void RS485FrameHub::read_uart_(uint32_t now) {
     if (!this->in_frame_) {
       if (this->previous_byte_ == this->dle_ && byte == this->stx_) {
         this->in_frame_ = true;
+        this->after_dle_ = false;
         this->raw_frame_.clear();
         this->raw_frame_.push_back(this->dle_);
         this->raw_frame_.push_back(this->stx_);
@@ -232,17 +241,32 @@ void RS485FrameHub::read_uart_(uint32_t now) {
     if (this->raw_frame_.size() >= this->max_frame_length_) {
       ESP_LOGW(TAG, "Frame exceeded max_frame_length");
       this->in_frame_ = false;
+      this->after_dle_ = false;
       this->raw_frame_.clear();
       this->previous_byte_ = byte;
       continue;
     }
     this->raw_frame_.push_back(byte);
 
-    const size_t size = this->raw_frame_.size();
-    if (size >= 2 && this->raw_frame_[size - 2] == this->dle_ && byte == this->etx_) {
-      this->process_raw_frame_(now);
-      this->in_frame_ = false;
-      this->raw_frame_.clear();
+    // Escape-aware terminator detection. Mid-frame, every DLE is resolved by the byte that
+    // follows it: DLE+ETX ends the frame, DLE+escape_marker is a stuffed literal DLE
+    // (escape_marker_ == DLE in doubling mode, == the escape byte otherwise), and any other
+    // successor is a protocol violation that validate_frame_ rejects. Tracking after_dle_ is
+    // required for doubling mode: peeking only at the previous raw byte miscounts adjacent
+    // DLEs (a DLE DLE literal just before a DLE ETX terminator, or a literal DLE followed by
+    // a literal ETX data byte).
+    if (this->after_dle_) {
+      // The pending DLE is now resolved by this byte; it cannot itself open a new escape
+      // sequence (in doubling mode the marker equals DLE but is consumed here as the partner
+      // of the pending DLE, not as a fresh DLE).
+      this->after_dle_ = false;
+      if (byte == this->etx_) {
+        this->process_raw_frame_(now);
+        this->in_frame_ = false;
+        this->raw_frame_.clear();
+      }
+    } else if (byte == this->dle_) {
+      this->after_dle_ = true;
     }
     // Maintain previous_byte_ for every in-frame byte too. Without this, a normal frame
     // terminator (DLE ETX) leaves previous_byte_ stale at the value seen just before the
@@ -300,7 +324,7 @@ bool RS485FrameHub::validate_frame_() {
 
   this->rx_unescaped_.clear();
   // The frame[] iteration covers bytes between the opening STX (index 1) and the closing
-  // DLE+ETX (last 2 bytes). A DLE inside that range must be followed by escape_byte_;
+  // DLE+ETX (last 2 bytes). A DLE inside that range must be followed by escape_marker_;
   // any other DLE successor is a protocol violation and the frame is rejected.
   for (size_t i = 2; i + 2 < frame.size(); i++) {
     uint8_t b = frame[i];
@@ -308,8 +332,9 @@ bool RS485FrameHub::validate_frame_() {
       // i+1 < frame.size()-2 means "DLE has a successor that is not part of the closing
       // DLE+ETX terminator". A DLE that is the first byte of DLE+ETX is handled by the
       // framer (loop terminates before reaching it), so reaching here means a DLE is
-      // followed by something that must be the escape byte. Anything else is invalid.
-      if (i + 1 < frame.size() - 2 && frame[i + 1] == this->escape_byte_) {
+      // followed by something that must be escape_marker_ (the escape byte, or DLE itself in
+      // doubling mode). Anything else is invalid.
+      if (i + 1 < frame.size() - 2 && frame[i + 1] == this->escape_marker_) {
         this->rx_unescaped_.push_back(this->dle_);
         i++;
         continue;
@@ -415,7 +440,7 @@ void RS485FrameHub::escape_dle_(const std::vector<uint8_t> &data, std::vector<ui
   for (auto b : data) {
     out.push_back(b);
     if (b == this->dle_)
-      out.push_back(this->escape_byte_);
+      out.push_back(this->escape_marker_);
   }
 }
 
@@ -443,7 +468,7 @@ void RS485FrameHub::build_frame_(const std::vector<uint8_t> &payload, std::vecto
     for (size_t i = 0; i < ncrc; i++) {
       out.push_back(crc_bytes[i]);
       if (crc_bytes[i] == this->dle_)
-        out.push_back(this->escape_byte_);
+        out.push_back(this->escape_marker_);
     }
   }
   out.push_back(this->dle_);
