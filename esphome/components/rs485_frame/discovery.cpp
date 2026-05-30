@@ -106,6 +106,7 @@ void RS485FrameDiscovery::tick(uint32_t now) {
   if (!this->report_primed_) {
     this->last_report_time_ = now;
     this->report_primed_ = true;
+    ESP_LOGI(TAG, "RS485 discovery initiated - will report in interval = %d ms", this->report_interval_ms_);
   }
   if (this->burst_open_ && now - this->last_byte_time_ >= this->idle_gap_ms_)
     this->close_burst_(now);
