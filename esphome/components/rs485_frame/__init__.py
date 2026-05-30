@@ -54,6 +54,9 @@ CONF_GATE = "gate"
 CONF_MAX_FRAME_LENGTH = "max_frame_length"
 CONF_MAX_FRAME_TYPES = "max_frame_types"
 CONF_MIN_FRAMING_CONFIDENCE = "min_framing_confidence"
+CONF_BAUD_SWEEP = "baud_sweep"
+CONF_DATA_BITS_SWEEP = "data_bits_sweep"
+CONF_DWELL = "dwell"
 CONF_MAX_QUEUE_SIZE = "max_queue_size"
 CONF_MAX_UNIQUE_PAYLOADS = "max_unique_payloads"
 CONF_MIN_SILENCE = "min_silence"
@@ -356,6 +359,21 @@ DISCOVERY_SCHEMA = cv.Schema(
         cv.Optional(CONF_MIN_FRAMING_CONFIDENCE, default=80): cv.int_range(
             min=0, max=100
         ),
+        # baud_sweep: when present, discovery cycles the UART through each baud rate (crossed with
+        # data_bits_sweep) for `dwell`, scores the framing at each, and locks onto the best before
+        # continuing. Omit it if you already know the baud rate. Runtime UART reconfiguration is
+        # implemented on ESP-IDF and ESP8266; on other platforms the sweep cannot change settings.
+        cv.Optional(CONF_BAUD_SWEEP): cv.All(
+            cv.ensure_list(cv.int_range(min=300, max=2000000)), cv.Length(min=1)
+        ),
+        # data_bits widths to try at each baud. RS485 is almost always 8; 7 is the only other
+        # value worth trying on legacy buses. Crossed with baud_sweep to form the candidate list.
+        cv.Optional(CONF_DATA_BITS_SWEEP, default=[8]): cv.All(
+            cv.ensure_list(cv.int_range(min=5, max=8)), cv.Length(min=1)
+        ),
+        # Time spent capturing at each candidate before scoring it. Needs enough traffic for the
+        # framing to converge; 10s suits a bus with a steady keep-alive. Raise it for sparse buses.
+        cv.Optional(CONF_DWELL, default="10s"): cv.positive_time_period_milliseconds,
     }
 )
 
@@ -574,6 +592,16 @@ async def to_code(config):
                 disc[CONF_MIN_FRAMING_CONFIDENCE],
             )
         )
+        # baud_sweep is optional: only wire the sweep when the user asked discovery to find the
+        # baud rate. data_bits_sweep and dwell have defaults, so they are always present here.
+        if (bauds := disc.get(CONF_BAUD_SWEEP)) is not None:
+            cg.add(
+                var.configure_discovery_baud_sweep(
+                    bauds,
+                    disc[CONF_DATA_BITS_SWEEP],
+                    disc[CONF_DWELL].total_milliseconds,
+                )
+            )
 
     for conf in config.get(CONF_ON_FRAME, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])

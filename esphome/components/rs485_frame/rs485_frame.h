@@ -184,6 +184,13 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
     this->discovery_ =
         std::make_unique<RS485FrameDiscovery>(interval_ms, idle_gap_ms, max_burst, min_framing_confidence);
   }
+  // Hand the discovery the UART so it can sweep baud / data-bit candidates at runtime. parent_
+  // is the hub's own UARTComponent (set by register_uart_device before this runs).
+  void configure_discovery_baud_sweep(const std::vector<uint32_t> &bauds, const std::vector<uint8_t> &data_bits,
+                                      uint32_t dwell_ms) {
+    if (this->discovery_ != nullptr)
+      this->discovery_->set_baud_sweep(this->parent_, bauds, data_bits, dwell_ms);
+  }
 #endif
 
   bool queue_command_value(uint32_t command);

@@ -142,6 +142,10 @@ rs485_frame:
       interval: 15s
       idle_gap: 4ms
       min_framing_confidence: 75
+      # Exercise the runtime baud/data-bits sweep codegen path.
+      baud_sweep: [9600, 19200, 38400]
+      data_bits_sweep: [7, 8]
+      dwell: 8s
 
 binary_sensor:
   # User RX decoding is done entirely through on_frame: + template sensors.

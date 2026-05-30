@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "esphome/components/uart/uart.h"
+
 namespace esphome::rs485_frame {
 
 // Passive framing/CRC discovery for an unknown DLE-framed bus. This is a bring-up tool: with
@@ -30,6 +32,16 @@ class RS485FrameDiscovery {
         idle_gap_ms_(idle_gap_ms),
         max_burst_(max_burst),
         min_framing_confidence_(min_framing_confidence) {}
+
+  // Enable the baud / data-bits sweep. Before normal analysis, the discovery cycles the UART
+  // through each (baud rate, data-bit width) candidate for dwell_ms, scores the framing at each
+  // using the same burst/CRC machinery, then locks onto the highest-scoring setting and reports
+  // a ready-to-paste uart: snippet. Reconfiguration uses the UART's runtime load_settings(),
+  // which is implemented on ESP-IDF and ESP8266; on platforms without it the sweep is a no-op.
+  // Parity and stop bits cannot be told apart by passive listening, so they are not swept (see
+  // the component docs). bauds empty (or uart null) leaves the sweep disabled.
+  void set_baud_sweep(uart::UARTComponent *uart, const std::vector<uint32_t> &bauds,
+                      const std::vector<uint8_t> &data_bits, uint32_t dwell_ms);
 
   // Reserve the burst buffer once; no allocation after setup().
   void setup();
@@ -66,6 +78,31 @@ class RS485FrameDiscovery {
   static const BytePair *top_pair_(const BytePair *table, size_t len);
   void reset_scoring_();
   void score_crc_(const std::vector<uint8_t> &content, bool unescaped_view);
+  // Framing confidence (percent) = the weaker of the top start-pair and end-pair shares of the
+  // voting bursts. Shared by report_() and the sweep result recorder.
+  uint32_t compute_confidence_(const BytePair *top_start, const BytePair *top_end) const;
+  // True once any CRC hypothesis has cleared its sample threshold with an unbroken match streak.
+  bool any_crc_match_() const;
+
+  // --- Baud / data-bits sweep ---
+  struct SweepResult {
+    uint32_t baud;
+    uint8_t data_bits;
+    bool dle_agrees;
+    uint32_t confidence;  // best framing confidence reached during the dwell
+    bool crc_matched;
+    uint32_t frames;
+  };
+  // Wipe all accumulated analysis state for a fresh measurement (used between sweep candidates
+  // and once more when the sweep locks, so post-sweep capture starts clean).
+  void reset_analyzer_();
+  size_t sweep_total_() const { return this->sweep_bauds_.size() * this->sweep_data_bits_.size(); }
+  uint32_t sweep_baud_at_(size_t idx) const { return this->sweep_bauds_[idx / this->sweep_data_bits_.size()]; }
+  uint8_t sweep_data_bits_at_(size_t idx) const { return this->sweep_data_bits_[idx % this->sweep_data_bits_.size()]; }
+  void sweep_tick_(uint32_t now);
+  void apply_sweep_candidate_(uint32_t now);
+  void record_sweep_result_();
+  void finish_sweep_(uint32_t now);
 
   uint32_t report_interval_ms_;
   uint32_t idle_gap_ms_;
@@ -113,6 +150,19 @@ class RS485FrameDiscovery {
 
   uint32_t crc_samples_[NUM_ESCAPE_VIEWS][NUM_CRC_HYPS] = {};
   uint32_t crc_matches_[NUM_ESCAPE_VIEWS][NUM_CRC_HYPS] = {};
+
+  // Baud / data-bits sweep state. Empty sweep_bauds_ (the default) leaves it disabled and the
+  // analyzer runs continuously at the YAML-configured UART settings.
+  uart::UARTComponent *uart_{nullptr};
+  std::vector<uint32_t> sweep_bauds_;
+  std::vector<uint8_t> sweep_data_bits_;
+  std::vector<SweepResult> sweep_results_;
+  uint32_t sweep_dwell_ms_{0};
+  bool sweeping_{false};
+  bool sweep_started_{false};
+  bool sweep_done_{false};
+  size_t sweep_idx_{0};
+  uint32_t sweep_phase_start_{0};
 };
 
 }  // namespace esphome::rs485_frame

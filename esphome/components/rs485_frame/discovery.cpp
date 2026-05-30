@@ -106,10 +106,16 @@ void RS485FrameDiscovery::tick(uint32_t now) {
   if (!this->report_primed_) {
     this->last_report_time_ = now;
     this->report_primed_ = true;
-    ESP_LOGI(TAG, "RS485 discovery initiated - will report in interval = %d ms", this->report_interval_ms_);
+    ESP_LOGI(TAG, "RS485 discovery started - first report in %" PRIu32 " ms", this->report_interval_ms_);
   }
   if (this->burst_open_ && now - this->last_byte_time_ >= this->idle_gap_ms_)
     this->close_burst_(now);
+  // While the sweep is running the analyzer state belongs to the current candidate, so the
+  // normal periodic report is suppressed; the sweep prints its own per-candidate lines.
+  if (this->sweeping_) {
+    this->sweep_tick_(now);
+    return;
+  }
   if (now - this->last_report_time_ >= this->report_interval_ms_) {
     this->report_();
     this->last_report_time_ = now;
@@ -359,9 +365,7 @@ void RS485FrameDiscovery::report_() {
   // candidate, taken as the weaker of the two. A wrong or noisy bus splits its votes across
   // many pairs, so the top pair holds only a small share; a real DLE bus is near 100%.
   const uint32_t denom = this->framing_bursts_ > 0 ? this->framing_bursts_ : 1;
-  const uint32_t start_pct = top_start->count * 100 / denom;
-  const uint32_t end_pct = top_end->count * 100 / denom;
-  const uint32_t confidence = start_pct < end_pct ? start_pct : end_pct;
+  const uint32_t confidence = this->compute_confidence_(top_start, top_end);
   const bool confident = dle_agrees && confidence >= this->min_framing_confidence_;
   if (dle_agrees) {
     ESP_LOGI(TAG,
@@ -432,6 +436,15 @@ void RS485FrameDiscovery::report_() {
                   "unsupported check");
   }
 
+  // If a baud/data-bits sweep ran, surface the locked UART settings so the user can copy them.
+  // Parity and stop bits are not detectable passively (see the component docs).
+  if (this->sweep_done_) {
+    ESP_LOGI(TAG, "  Suggested uart config (from sweep; parity/stop_bits not passively detectable):");
+    ESP_LOGI(TAG, "    uart:");
+    ESP_LOGI(TAG, "      baud_rate: %" PRIu32, this->uart_->get_baud_rate());
+    ESP_LOGI(TAG, "      data_bits: %u", this->uart_->get_data_bits());
+  }
+
   // Ready-to-paste config suggestion (only when the framing delimiters are coherent and the
   // top candidate clears the confidence threshold).
   if (confident) {
@@ -448,6 +461,158 @@ void RS485FrameDiscovery::report_() {
       ESP_LOGI(TAG, "      escape: {mode: escape_byte, byte: 0x%02x}", escape_marker);
     }
   }
+}
+
+uint32_t RS485FrameDiscovery::compute_confidence_(const BytePair *top_start, const BytePair *top_end) const {
+  const uint32_t denom = this->framing_bursts_ > 0 ? this->framing_bursts_ : 1;
+  const uint32_t start_pct = top_start->count * 100 / denom;
+  const uint32_t end_pct = top_end->count * 100 / denom;
+  return start_pct < end_pct ? start_pct : end_pct;
+}
+
+bool RS485FrameDiscovery::any_crc_match_() const {
+  for (size_t v = 0; v < NUM_ESCAPE_VIEWS; v++) {
+    for (size_t h = 0; h < NUM_CRC_HYPS; h++) {
+      const uint32_t need = CRC_HYPS[h].width == 1 ? MIN_CRC_SAMPLES_W1 : MIN_CRC_SAMPLES_W2;
+      const uint32_t samples = this->crc_samples_[v][h];
+      if (samples >= need && this->crc_matches_[v][h] == samples)
+        return true;
+    }
+  }
+  return false;
+}
+
+void RS485FrameDiscovery::reset_analyzer_() {
+  this->burst_.clear();
+  this->burst_open_ = false;
+  this->burst_truncated_ = false;
+  this->start_pairs_len_ = 0;
+  this->end_pairs_len_ = 0;
+  this->total_bursts_ = 0;
+  this->framing_bursts_ = 0;
+  this->total_frames_ = 0;
+  for (uint32_t &slot : this->dle_succ_hist_)
+    slot = 0;
+  this->dle_succ_total_ = 0;
+  this->scored_valid_ = false;
+  this->scored_has_marker_ = false;
+  this->scored_marker_ = 0;
+  this->reset_scoring_();
+}
+
+void RS485FrameDiscovery::set_baud_sweep(uart::UARTComponent *uart, const std::vector<uint32_t> &bauds,
+                                         const std::vector<uint8_t> &data_bits, uint32_t dwell_ms) {
+  this->uart_ = uart;
+  this->sweep_bauds_ = bauds;
+  this->sweep_data_bits_ = data_bits;
+  this->sweep_dwell_ms_ = dwell_ms;
+  // A sweep needs a UART to reconfigure and at least one baud and one data-bit width to try.
+  // Runtime UART reconfiguration (load_settings) only exists on ESP-IDF and ESP8266; on other
+  // platforms the sweep cannot change the line settings, so it is disabled rather than silently
+  // scoring every candidate against the unchanged hardware baud.
+#if defined(USE_ESP8266) || defined(USE_ESP32)
+  this->sweeping_ = uart != nullptr && !bauds.empty() && !data_bits.empty();
+  if (this->sweeping_)
+    this->sweep_results_.resize(this->sweep_total_());
+#else
+  this->sweeping_ = false;
+  if (uart != nullptr && !bauds.empty())
+    ESP_LOGW(TAG, "discovery baud_sweep is not supported on this platform (no runtime UART reconfiguration); ignoring");
+#endif
+}
+
+void RS485FrameDiscovery::apply_sweep_candidate_(uint32_t now) {
+  const uint32_t baud = this->sweep_baud_at_(this->sweep_idx_);
+  const uint8_t data_bits = this->sweep_data_bits_at_(this->sweep_idx_);
+  if (this->uart_ != nullptr) {
+    this->uart_->set_baud_rate(baud);
+    this->uart_->set_data_bits(data_bits);
+    // Tears down and reinstalls the UART driver with the new line settings, flushing any bytes
+    // received under the previous (wrong) candidate. The sweep is only enabled on platforms that
+    // provide load_settings (see set_baud_sweep), so this is always reached on a real sweep.
+#if defined(USE_ESP8266) || defined(USE_ESP32)
+    this->uart_->load_settings(false);
+#endif
+  }
+  this->reset_analyzer_();
+  this->sweep_phase_start_ = now;
+  ESP_LOGI(TAG, "Baud sweep: trying %" PRIu32 " baud, %u data bits (candidate %zu/%zu) for %" PRIu32 " ms", baud,
+           data_bits, this->sweep_idx_ + 1, this->sweep_total_(), this->sweep_dwell_ms_);
+}
+
+void RS485FrameDiscovery::record_sweep_result_() {
+  const BytePair *top_start = top_pair_(this->start_pairs_, this->start_pairs_len_);
+  const BytePair *top_end = top_pair_(this->end_pairs_, this->end_pairs_len_);
+  SweepResult r{};
+  r.baud = this->sweep_baud_at_(this->sweep_idx_);
+  r.data_bits = this->sweep_data_bits_at_(this->sweep_idx_);
+  r.frames = this->total_frames_;
+  if (top_start != nullptr && top_end != nullptr) {
+    r.dle_agrees = top_start->a == top_end->a;
+    r.confidence = this->compute_confidence_(top_start, top_end);
+  }
+  r.crc_matched = this->any_crc_match_();
+  this->sweep_results_[this->sweep_idx_] = r;
+  ESP_LOGI(TAG,
+           "Baud sweep result: %" PRIu32 " baud %u data bits -> framing confidence %" PRIu32 "%%, %s, %" PRIu32
+           " frames",
+           r.baud, r.data_bits, r.confidence, r.crc_matched ? "CRC matched" : "no CRC match", r.frames);
+}
+
+void RS485FrameDiscovery::finish_sweep_(uint32_t now) {
+  // Rank: a candidate with a consistent CRC beats one without; among equals, higher framing
+  // confidence wins. CRC agreement is the strongest signal the line settings are right, because
+  // a wrong baud or data-bit width corrupts the bytes so no checksum can match across frames.
+  size_t best = 0;
+  for (size_t i = 1; i < this->sweep_results_.size(); i++) {
+    const SweepResult &a = this->sweep_results_[i];
+    const SweepResult &b = this->sweep_results_[best];
+    const bool better = a.crc_matched != b.crc_matched ? a.crc_matched : a.confidence > b.confidence;
+    if (better)
+      best = i;
+  }
+  const SweepResult &win = this->sweep_results_[best];
+  if (!win.crc_matched && win.confidence < this->min_framing_confidence_) {
+    ESP_LOGW(TAG,
+             "Baud sweep: no candidate produced coherent DLE framing (best %" PRIu32 " baud %u data bits at %" PRIu32
+             "%% confidence). The bus may not be DLE-framed, or its real baud/data bits are outside the swept list.",
+             win.baud, win.data_bits, win.confidence);
+  }
+  if (this->uart_ != nullptr) {
+    this->uart_->set_baud_rate(win.baud);
+    this->uart_->set_data_bits(win.data_bits);
+#if defined(USE_ESP8266) || defined(USE_ESP32)
+    this->uart_->load_settings(false);
+#endif
+  }
+  ESP_LOGI(TAG,
+           "Baud sweep complete: locked to %" PRIu32 " baud, %u data bits (framing confidence %" PRIu32
+           "%%, %s). Continuing discovery at these settings.",
+           win.baud, win.data_bits, win.confidence, win.crc_matched ? "CRC matched" : "no CRC match");
+  this->reset_analyzer_();
+  this->sweeping_ = false;
+  this->sweep_done_ = true;
+  this->last_report_time_ = now;
+}
+
+void RS485FrameDiscovery::sweep_tick_(uint32_t now) {
+  if (!this->sweep_started_) {
+    ESP_LOGI(TAG, "Starting baud/data-bits sweep: %zu candidate(s), %" PRIu32 " ms each", this->sweep_total_(),
+             this->sweep_dwell_ms_);
+    this->sweep_idx_ = 0;
+    this->sweep_started_ = true;
+    this->apply_sweep_candidate_(now);
+    return;
+  }
+  if (now - this->sweep_phase_start_ < this->sweep_dwell_ms_)
+    return;
+  this->record_sweep_result_();
+  this->sweep_idx_++;
+  if (this->sweep_idx_ >= this->sweep_total_()) {
+    this->finish_sweep_(now);
+    return;
+  }
+  this->apply_sweep_candidate_(now);
 }
 
 }  // namespace esphome::rs485_frame
