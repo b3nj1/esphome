@@ -122,6 +122,10 @@ class RS485FrameDiscovery {
 
   uint32_t last_report_time_{0};
   bool report_primed_{false};
+  // Heartbeat so the log is not silent for a whole report interval after boot. A one-shot boot
+  // line is unreliable: it is logged before the network log client connects and so is missed.
+  uint32_t last_status_time_{0};
+  bool first_report_done_{false};
 
   uint32_t total_bursts_{0};
   uint32_t framing_bursts_{0};  // bursts long enough (>= 4 bytes) to vote for a delimiter pair

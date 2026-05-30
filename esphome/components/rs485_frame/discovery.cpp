@@ -20,6 +20,8 @@ static const uint32_t MIN_DLE_SUCC = 4;
 // 2-byte CRC before a consistent match is meaningful.
 static const uint32_t MIN_CRC_SAMPLES_W1 = 20;
 static const uint32_t MIN_CRC_SAMPLES_W2 = 8;
+// Cadence of the "collecting traffic" heartbeat printed before the first full report.
+static const uint32_t STATUS_HEARTBEAT_MS = 5000;
 
 enum CrcAlgo : uint8_t { ALGO_SUM8, ALGO_XOR8, ALGO_SUM16, ALGO_MODBUS };
 
@@ -105,8 +107,8 @@ void RS485FrameDiscovery::feed_byte(uint8_t b, uint32_t now) {
 void RS485FrameDiscovery::tick(uint32_t now) {
   if (!this->report_primed_) {
     this->last_report_time_ = now;
+    this->last_status_time_ = now;
     this->report_primed_ = true;
-    ESP_LOGI(TAG, "RS485 discovery started - first report in %" PRIu32 " ms", this->report_interval_ms_);
   }
   if (this->burst_open_ && now - this->last_byte_time_ >= this->idle_gap_ms_)
     this->close_burst_(now);
@@ -118,7 +120,19 @@ void RS485FrameDiscovery::tick(uint32_t now) {
   }
   if (now - this->last_report_time_ >= this->report_interval_ms_) {
     this->report_();
+    this->first_report_done_ = true;
     this->last_report_time_ = now;
+    this->last_status_time_ = now;
+    return;
+  }
+  // Until the first full report fires, emit a lightweight heartbeat every STATUS_HEARTBEAT_MS so
+  // the log window is not silent for a whole interval after boot. Skipped when the interval is
+  // already short enough that the first report arrives promptly.
+  if (!this->first_report_done_ && this->report_interval_ms_ > STATUS_HEARTBEAT_MS &&
+      now - this->last_status_time_ >= STATUS_HEARTBEAT_MS) {
+    this->last_status_time_ = now;
+    ESP_LOGI(TAG, "RS485 discovery: collecting traffic (%" PRIu32 " bursts, %" PRIu32 " frames so far)",
+             this->total_bursts_, this->total_frames_);
   }
 }
 
@@ -593,6 +607,7 @@ void RS485FrameDiscovery::finish_sweep_(uint32_t now) {
   this->sweeping_ = false;
   this->sweep_done_ = true;
   this->last_report_time_ = now;
+  this->last_status_time_ = now;
 }
 
 void RS485FrameDiscovery::sweep_tick_(uint32_t now) {
