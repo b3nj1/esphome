@@ -214,6 +214,7 @@ void RS485FrameDiscovery::analyze_burst_() {
   // Framing-byte candidates from the burst's first and last byte pairs. Even a burst that holds
   // several back-to-back frames opens with the first frame's DLE+STX and closes with the last
   // frame's DLE+ETX, so these pairs still vote for the right delimiters.
+  this->framing_bursts_++;
   this->bump_pair_(this->start_pairs_, this->start_pairs_len_, b[0], b[1]);
   this->bump_pair_(this->end_pairs_, this->end_pairs_len_, b[len - 2], b[len - 1]);
 
@@ -353,9 +354,25 @@ void RS485FrameDiscovery::report_() {
     return;
 
   const bool dle_agrees = top_start->a == top_end->a;
+  // Framing confidence = the share of voting bursts whose opening/closing pair is the top
+  // candidate, taken as the weaker of the two. A wrong or noisy bus splits its votes across
+  // many pairs, so the top pair holds only a small share; a real DLE bus is near 100%.
+  const uint32_t denom = this->framing_bursts_ > 0 ? this->framing_bursts_ : 1;
+  const uint32_t start_pct = top_start->count * 100 / denom;
+  const uint32_t end_pct = top_end->count * 100 / denom;
+  const uint32_t confidence = start_pct < end_pct ? start_pct : end_pct;
+  const bool confident = dle_agrees && confidence >= this->min_framing_confidence_;
   if (dle_agrees) {
-    ESP_LOGI(TAG, "  Framing: DLE=0x%02x STX=0x%02x ETX=0x%02x  (start pair x%" PRIu32 ", end pair x%" PRIu32 ")",
-             top_start->a, top_start->b, top_end->b, top_start->count, top_end->count);
+    ESP_LOGI(TAG,
+             "  Framing: DLE=0x%02x STX=0x%02x ETX=0x%02x  (confidence %" PRIu32 "%%, start pair x%" PRIu32
+             ", end pair x%" PRIu32 " of %" PRIu32 " bursts)",
+             top_start->a, top_start->b, top_end->b, confidence, top_start->count, top_end->count, denom);
+    if (!confident) {
+      ESP_LOGI(TAG,
+               "  Framing confidence %" PRIu32 "%% is below the %u%% threshold - delimiters not yet trusted. "
+               "Capture more traffic, or lower discovery.min_framing_confidence if this bus is genuinely noisy.",
+               confidence, this->min_framing_confidence_);
+    }
   } else {
     ESP_LOGI(TAG, "  Framing AMBIGUOUS: start pair 0x%02x 0x%02x (x%" PRIu32 "), end pair 0x%02x 0x%02x (x%" PRIu32 ")",
              top_start->a, top_start->b, top_start->count, top_end->a, top_end->b, top_end->count);
@@ -414,8 +431,9 @@ void RS485FrameDiscovery::report_() {
                   "unsupported check");
   }
 
-  // Ready-to-paste config suggestion (only when the framing delimiters are coherent).
-  if (dle_agrees) {
+  // Ready-to-paste config suggestion (only when the framing delimiters are coherent and the
+  // top candidate clears the confidence threshold).
+  if (confident) {
     ESP_LOGI(TAG, "  Suggested framing/escape config:");
     ESP_LOGI(TAG, "    framing:");
     ESP_LOGI(TAG, "      dle: 0x%02x", top_start->a);

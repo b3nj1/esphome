@@ -141,6 +141,7 @@ rs485_frame:
     discovery:
       interval: 15s
       idle_gap: 4ms
+      min_framing_confidence: 75
 
 binary_sensor:
   # User RX decoding is done entirely through on_frame: + template sensors.

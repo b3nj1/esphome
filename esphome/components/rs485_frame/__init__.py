@@ -53,6 +53,7 @@ CONF_FRAMING = "framing"
 CONF_GATE = "gate"
 CONF_MAX_FRAME_LENGTH = "max_frame_length"
 CONF_MAX_FRAME_TYPES = "max_frame_types"
+CONF_MIN_FRAMING_CONFIDENCE = "min_framing_confidence"
 CONF_MAX_QUEUE_SIZE = "max_queue_size"
 CONF_MAX_UNIQUE_PAYLOADS = "max_unique_payloads"
 CONF_MIN_SILENCE = "min_silence"
@@ -348,6 +349,13 @@ DISCOVERY_SCHEMA = cv.Schema(
         # The segmenter resolves gaps only at loop granularity, so very tightly packed frames
         # may merge — raise this only if bursts are being split mid-frame.
         cv.Optional(CONF_IDLE_GAP, default="5ms"): cv.positive_time_period_milliseconds,
+        # Minimum share (percent) of voting bursts that must agree on the top start/end delimiter
+        # pair before discovery reports the framing as confident and prints a ready-to-paste
+        # config. A real DLE-framed bus sits near 100%; a non-DLE or noisy bus splits its votes
+        # and stays low. Set to 0 to always print the best guess. CRC scoring is unaffected.
+        cv.Optional(CONF_MIN_FRAMING_CONFIDENCE, default=80): cv.int_range(
+            min=0, max=100
+        ),
     }
 )
 
@@ -563,6 +571,7 @@ async def to_code(config):
                 disc[CONF_INTERVAL].total_milliseconds,
                 disc[CONF_IDLE_GAP].total_milliseconds,
                 config[CONF_MAX_FRAME_LENGTH],
+                disc[CONF_MIN_FRAMING_CONFIDENCE],
             )
         )
 

@@ -180,8 +180,9 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
 #ifdef USE_RS485_FRAME_DISCOVERY
   // Owns the discovery analyzer. Called once from to_code when discovery: is present. With
   // discovery active the hub bypasses framing/validation/TX entirely (see loop()).
-  void enable_discovery(uint32_t interval_ms, uint32_t idle_gap_ms, size_t max_burst) {
-    this->discovery_ = std::make_unique<RS485FrameDiscovery>(interval_ms, idle_gap_ms, max_burst);
+  void enable_discovery(uint32_t interval_ms, uint32_t idle_gap_ms, size_t max_burst, uint8_t min_framing_confidence) {
+    this->discovery_ =
+        std::make_unique<RS485FrameDiscovery>(interval_ms, idle_gap_ms, max_burst, min_framing_confidence);
   }
 #endif
 

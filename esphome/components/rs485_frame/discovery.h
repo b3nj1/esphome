@@ -24,8 +24,12 @@ namespace esphome::rs485_frame {
 // discovery (see USE_RS485_FRAME_DISCOVERY).
 class RS485FrameDiscovery {
  public:
-  RS485FrameDiscovery(uint32_t report_interval_ms, uint32_t idle_gap_ms, size_t max_burst)
-      : report_interval_ms_(report_interval_ms), idle_gap_ms_(idle_gap_ms), max_burst_(max_burst) {}
+  RS485FrameDiscovery(uint32_t report_interval_ms, uint32_t idle_gap_ms, size_t max_burst,
+                      uint8_t min_framing_confidence)
+      : report_interval_ms_(report_interval_ms),
+        idle_gap_ms_(idle_gap_ms),
+        max_burst_(max_burst),
+        min_framing_confidence_(min_framing_confidence) {}
 
   // Reserve the burst buffer once; no allocation after setup().
   void setup();
@@ -66,6 +70,11 @@ class RS485FrameDiscovery {
   uint32_t report_interval_ms_;
   uint32_t idle_gap_ms_;
   size_t max_burst_;
+  // The top start/end delimiter pair must account for at least this percentage of the bursts
+  // that voted (length >= 4) before the framing is reported as confident and a ready-to-paste
+  // config is suggested. 0 disables the gate. CRC scoring is unaffected: it always runs against
+  // the current top candidate and self-corrects via reset_scoring_ when that candidate shifts.
+  uint8_t min_framing_confidence_;
 
   std::vector<uint8_t> burst_;
   std::vector<uint8_t> unescaped_;  // scratch for unescaping a candidate frame's interior
@@ -78,7 +87,8 @@ class RS485FrameDiscovery {
   bool report_primed_{false};
 
   uint32_t total_bursts_{0};
-  uint32_t total_frames_{0};  // individual frames extracted from all bursts
+  uint32_t framing_bursts_{0};  // bursts long enough (>= 4 bytes) to vote for a delimiter pair
+  uint32_t total_frames_{0};    // individual frames extracted from all bursts
 
   BytePair start_pairs_[PAIR_TABLE_SIZE];
   BytePair end_pairs_[PAIR_TABLE_SIZE];
