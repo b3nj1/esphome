@@ -194,6 +194,8 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
 #endif
 
   bool queue_command_value(uint32_t command);
+  bool queue_command_with_format(uint32_t command, const std::vector<uint8_t> &preamble, uint8_t command_size,
+                                 bool big_endian, uint8_t repeat, const std::vector<uint8_t> &postamble);
   bool queue_raw_frame(const std::vector<uint8_t> &payload);
   // Assemble frame_type + payload into a pre-reserved buffer and queue it. Used by the
   // send_frame action and the raw-form button so neither allocates a per-call vector.

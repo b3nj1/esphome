@@ -88,9 +88,11 @@ rs485_frame:
     uart_id: uart_bus
     discovery: {}
 
-# Buttons exercise both _final_validate branches:
-#   - command-form against a hub that has a command_format (cmd_hub)  -> accepted
-#   - raw form against a hub with no command_format (raw_hub)         -> accepted
+# Buttons exercise all _validate_button + _final_validate branches:
+#   - command-form against a hub that has command_format (cmd_hub)             -> accepted
+#   - raw form against a hub with no command_format (raw_hub)                  -> accepted
+#   - command + button-level command_format overriding hub's format (cmd_hub)  -> accepted
+#   - command + button-level command_format against hub with no format (raw_hub) -> accepted
 button:
   - platform: rs485_frame
     rs485_frame_id: cmd_hub
@@ -102,3 +104,28 @@ button:
     name: "Validate Raw"
     frame_type: [0x00, 0xA1]
     payload: [0x01, 0x02, 0x03, 0x04]
+
+  # Per-button command_format: override against a hub that already has its own format.
+  # Exercises the branch where the button's format takes precedence over the hub's.
+  - platform: rs485_frame
+    rs485_frame_id: cmd_hub
+    name: "Validate Button Format Override"
+    command: 0x08000000
+    command_format:
+      preamble: [0x00, 0x03]
+      command_size: 4
+      command_endian: big
+      command_repeat: 2
+
+  # Per-button command_format: against a hub with no hub-level format.
+  # Exercises the button-supplies-format path; _final_validate must not reject this.
+  - platform: rs485_frame
+    rs485_frame_id: raw_hub
+    name: "Validate Button Supplies Format"
+    command: 0x00000001
+    command_format:
+      preamble: [0x00, 0x83, 0x01]
+      command_size: 4
+      command_endian: big
+      command_repeat: 2
+      postamble: [0x00]

@@ -5,8 +5,14 @@ from esphome.const import CONF_COMMAND, CONF_PAYLOAD
 import esphome.final_validate as fv
 
 from .. import (
+    COMMAND_FORMAT_SCHEMA,
+    CONF_COMMAND_ENDIAN,
     CONF_COMMAND_FORMAT,
+    CONF_COMMAND_REPEAT,
+    CONF_COMMAND_SIZE,
     CONF_FRAME_TYPE,
+    CONF_POSTAMBLE,
+    CONF_PREAMBLE,
     CONF_RS485_FRAME_ID,
     MAX_FRAME_LENGTH_UPPER,
     RS485FrameHub,
@@ -22,12 +28,20 @@ RS485FrameButton = rs485_frame_ns.class_("RS485FrameButton", button.Button)
 
 
 def _validate_button(config):
-    # Exactly one of `command:` (encoded via the hub's command_format) or the raw pair
-    # (`frame_type:` + `payload:`, emitted verbatim) must be supplied.
     has_command = CONF_COMMAND in config
     has_frame_type = CONF_FRAME_TYPE in config
     has_payload = CONF_PAYLOAD in config
+    has_cmd_format = CONF_COMMAND_FORMAT in config
 
+    if has_cmd_format and not has_command:
+        raise cv.Invalid(
+            "rs485_frame button: 'command_format' requires 'command'. "
+            "Per-button command_format is only meaningful with the 'command:' form."
+        )
+    if has_cmd_format and (has_frame_type or has_payload):
+        raise cv.Invalid(
+            "rs485_frame button: 'command_format' cannot be combined with 'frame_type'/'payload'."
+        )
     if has_command and (has_frame_type or has_payload):
         raise cv.Invalid(
             "rs485_frame button: 'command' is mutually exclusive with 'frame_type'/'payload'. "
@@ -57,6 +71,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_PAYLOAD): cv.All(
                 cv.ensure_list(validate_byte), cv.Length(max=MAX_FRAME_LENGTH_UPPER)
             ),
+            cv.Optional(CONF_COMMAND_FORMAT): COMMAND_FORMAT_SCHEMA,
         }
     ),
     _validate_button,
@@ -64,10 +79,11 @@ CONFIG_SCHEMA = cv.All(
 
 
 def _final_validate(config):
-    # The `command:` form is only meaningful when the hub has a command_format (it encodes
-    # the uint32 command into the on-wire payload). Reject `command:` against a hub with no
-    # command_format so users see a clear error instead of the button silently doing nothing.
+    # The `command:` form requires a command_format somewhere — either on the button itself
+    # or on the hub. If the button supplies its own command_format, skip the hub check.
     if CONF_COMMAND not in config:
+        return config
+    if CONF_COMMAND_FORMAT in config:
         return config
 
     full_config = fv.full_config.get()
@@ -76,8 +92,8 @@ def _final_validate(config):
     if CONF_COMMAND_FORMAT not in hub_config:
         raise cv.Invalid(
             "rs485_frame button 'command' requires the referenced hub to have a "
-            "'command_format:' block. Add one to the hub, or use the raw 'frame_type' + "
-            "'payload' form instead."
+            "'command_format:' block. Add one to the hub, add 'command_format:' directly "
+            "to this button, or use the raw 'frame_type' + 'payload' form instead."
         )
     return config
 
@@ -88,7 +104,18 @@ FINAL_VALIDATE_SCHEMA = _final_validate
 async def to_code(config):
     hub = await cg.get_variable(config[CONF_RS485_FRAME_ID])
     if CONF_COMMAND in config:
-        await button.new_button(config, hub, config[CONF_COMMAND])
+        var = await button.new_button(config, hub, config[CONF_COMMAND])
+        if CONF_COMMAND_FORMAT in config:
+            cf = config[CONF_COMMAND_FORMAT]
+            cg.add(
+                var.set_command_format(
+                    cf[CONF_PREAMBLE],
+                    cf[CONF_COMMAND_SIZE],
+                    cf[CONF_COMMAND_ENDIAN] == "big",
+                    cf[CONF_COMMAND_REPEAT],
+                    cf[CONF_POSTAMBLE],
+                )
+            )
     else:
         await button.new_button(
             config, hub, config[CONF_FRAME_TYPE], config[CONF_PAYLOAD]

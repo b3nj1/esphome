@@ -608,6 +608,32 @@ void RS485FrameHub::send_next_idle_(uint32_t now) {
   // Idle keepalives are not counted in commands_sent_ — that counter tracks only real HA commands.
 }
 
+bool RS485FrameHub::queue_command_with_format(uint32_t command, const std::vector<uint8_t> &preamble,
+                                              uint8_t command_size, bool big_endian, uint8_t repeat,
+                                              const std::vector<uint8_t> &postamble) {
+  if (this->sniffer_only_) {
+    ESP_LOGW(TAG, "Ignoring command because sniffer_only is enabled");
+    this->command_drops_++;
+    return false;
+  }
+  this->tx_payload_buf_.clear();
+  for (uint8_t b : preamble)
+    this->tx_payload_buf_.push_back(b);
+  for (uint8_t r = 0; r < repeat; r++) {
+    if (big_endian) {
+      for (int byte = static_cast<int>(command_size) - 1; byte >= 0; byte--)
+        this->tx_payload_buf_.push_back((command >> (byte * 8)) & 0xFF);
+    } else {
+      for (uint8_t byte = 0; byte < command_size; byte++)
+        this->tx_payload_buf_.push_back((command >> (byte * 8)) & 0xFF);
+    }
+  }
+  for (uint8_t b : postamble)
+    this->tx_payload_buf_.push_back(b);
+  this->build_frame_(this->tx_payload_buf_, this->tx_frame_buf_);
+  return this->enqueue_frame_();
+}
+
 bool RS485FrameHub::queue_raw_frame(const std::vector<uint8_t> &payload) {
   if (this->sniffer_only_) {
     ESP_LOGW(TAG, "Ignoring raw frame because sniffer_only is enabled");
@@ -662,6 +688,11 @@ void RS485FrameHub::update_last_frame_type_() {
 void RS485FrameButton::press_action() {
   if (this->raw_mode_) {
     this->parent_->queue_raw_frame(this->raw_frame_);
+  } else if (this->has_cmd_format_) {
+    std::vector<uint8_t> preamble(this->cmd_preamble_.begin(), this->cmd_preamble_.end());
+    std::vector<uint8_t> postamble(this->cmd_postamble_.begin(), this->cmd_postamble_.end());
+    this->parent_->queue_command_with_format(this->command_value_, preamble, this->cmd_command_size_,
+                                             this->cmd_big_endian_, this->cmd_repeat_, postamble);
   } else {
     this->parent_->queue_command_value(this->command_value_);
   }
