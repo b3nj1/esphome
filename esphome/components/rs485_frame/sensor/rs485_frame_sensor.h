@@ -9,9 +9,6 @@ namespace esphome::rs485_frame {
 /// Diagnostic sensor that publishes a hub state value (frames received, CRC failures,
 /// queue depth, etc.) on change only. User payload decoding is done via on_frame: +
 /// globals: + template sensors; this platform is only for hub diagnostics.
-///
-/// sensor::Sensor::publish_state() deduplicates equal-valued publishes internally, so
-/// a counter that has not advanced does not generate API traffic.
 class RS485FrameSensor : public sensor::Sensor, public Component {
  public:
   void set_parent(RS485FrameHub *parent) { this->parent_ = parent; }
@@ -41,13 +38,21 @@ class RS485FrameSensor : public sensor::Sensor, public Component {
         value = static_cast<float>(this->parent_->get_queue_depth());
         break;
     }
-    this->publish_state(value);
+    // Publish only on change: sensor::Sensor::publish_state does not deduplicate
+    // internally, so we gate here to avoid per-loop API/log traffic when idle.
+    if (!this->has_published_ || value != this->last_value_) {
+      this->publish_state(value);
+      this->last_value_ = value;
+      this->has_published_ = true;
+    }
   }
   float get_setup_priority() const override { return setup_priority::DATA; }
 
  protected:
   RS485FrameHub *parent_{nullptr};
   SensorDecode decode_{SENSOR_DECODE_FRAMES_RECEIVED};
+  float last_value_{0.0f};
+  bool has_published_{false};
 };
 
 }  // namespace esphome::rs485_frame

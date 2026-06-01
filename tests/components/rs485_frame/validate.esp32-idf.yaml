@@ -16,7 +16,7 @@ rs485_frame:
         mode: escape_byte
         byte: 0x00
     crc:
-      type: sum16
+      type: sum16_big_endian
       rx_accept: [header_inclusive, payload_only]
       tx_variant: header_inclusive
     tx:

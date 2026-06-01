@@ -56,11 +56,12 @@ enum CrcVariant {
 
 /// CRC algorithm applied to each frame.
 enum CrcType {
-  CRC_TYPE_NONE,          ///< No CRC — every structurally valid frame is accepted.
-  CRC_TYPE_SUM8,          ///< 8-bit arithmetic sum.
-  CRC_TYPE_SUM16,         ///< 16-bit arithmetic sum.
-  CRC_TYPE_XOR8,          ///< 8-bit XOR.
-  CRC_TYPE_CRC16_MODBUS,  ///< CRC-16/MODBUS (poly 0xA001, init 0xFFFF, little-endian output).
+  CRC_TYPE_NONE,                 ///< No CRC — every structurally valid frame is accepted.
+  CRC_TYPE_SUM8,                 ///< 8-bit arithmetic sum.
+  CRC_TYPE_SUM16_BIG_ENDIAN,     ///< 16-bit arithmetic sum, CRC bytes on the wire high byte first.
+  CRC_TYPE_SUM16_LITTLE_ENDIAN,  ///< 16-bit arithmetic sum, CRC bytes on the wire low byte first.
+  CRC_TYPE_XOR8,                 ///< 8-bit XOR.
+  CRC_TYPE_CRC16_MODBUS,         ///< CRC-16/MODBUS (poly 0xA001, init 0xFFFF, little-endian output).
 };
 
 /// TX queue overflow strategy.
@@ -216,6 +217,10 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   bool validate_frame_();
   uint16_t calculate_crc_(const std::vector<uint8_t> &payload, bool include_header) const;
   size_t crc_length_() const;
+  /// True when the 2-byte CRC is read/emitted low byte first (CRC-16/MODBUS, sum16 little-endian).
+  bool crc_little_endian_() const {
+    return this->crc_type_ == CRC_TYPE_CRC16_MODBUS || this->crc_type_ == CRC_TYPE_SUM16_LITTLE_ENDIAN;
+  }
   void escape_dle_(const std::vector<uint8_t> &data, std::vector<uint8_t> &out) const;
   void build_frame_(const std::vector<uint8_t> &payload, std::vector<uint8_t> &out);
   void build_key_payload_(uint32_t command, std::vector<uint8_t> &out) const;
@@ -244,7 +249,7 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   uint8_t escape_marker_{0x00};
   bool accept_header_crc_{true};
   bool accept_payload_crc_{true};
-  CrcType crc_type_{CRC_TYPE_SUM16};
+  CrcType crc_type_{CRC_TYPE_SUM16_BIG_ENDIAN};
   CrcVariant tx_crc_variant_{CRC_HEADER_INCLUSIVE};
   TxGateMode tx_gate_mode_{TX_GATE_FRAME_TRIGGER};
   // Empty by default: there is no protocol-agnostic gate frame. The Python schema requires

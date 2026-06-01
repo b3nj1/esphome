@@ -83,7 +83,8 @@ CRC_VARIANTS = {
 CRC_TYPES = {
     "none": CrcType.CRC_TYPE_NONE,
     "sum8": CrcType.CRC_TYPE_SUM8,
-    "sum16": CrcType.CRC_TYPE_SUM16,
+    "sum16_big_endian": CrcType.CRC_TYPE_SUM16_BIG_ENDIAN,
+    "sum16_little_endian": CrcType.CRC_TYPE_SUM16_LITTLE_ENDIAN,
     "xor8": CrcType.CRC_TYPE_XOR8,
     "crc16_modbus": CrcType.CRC_TYPE_CRC16_MODBUS,
 }
@@ -287,11 +288,10 @@ SNIFFER_MAX_FRAME_TYPES_UPPER = 64
 # making it easy to OOM an ESP8266 via a typo.
 SNIFFER_MAX_UNIQUE_PAYLOADS_UPPER = 64
 
-# Upper bound for sniffer_stats payload_capture_bytes. The sniffer truncates each captured
-# payload to this length; 256 covers the widest legal frame in any supported protocol while
-# keeping the table memory bounded. A frame longer than this is still uniquely identified
-# by its first 256 bytes — collisions on the first 256 bytes are astronomically unlikely.
-SNIFFER_PAYLOAD_CAPTURE_BYTES_UPPER = 256
+# Upper bound for sniffer_stats payload_capture_bytes. PayloadCapture::len is uint8_t, so
+# 256 wraps to 0 — cap at 255. A frame longer than this is still uniquely identified by its
+# first 255 bytes; collisions on the first 255 bytes are astronomically unlikely.
+SNIFFER_PAYLOAD_CAPTURE_BYTES_UPPER = 255
 
 TX_SCHEMA = cv.Schema(
     {

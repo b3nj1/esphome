@@ -6,6 +6,9 @@ globals:
     type: std::string
     initial_value: '""'
 
+# NOTE: every hub below shares one UART (uart_bus) so this single config exercises all hub modes
+# for compile/config coverage. On real hardware each actively-transmitting hub needs its own UART;
+# this is a test fixture, not a wiring example.
 rs485_frame:
   # Hub 1 — exercises on_frame: triggers + diagnostic sensors + button + number.
   # crc: is required (it has no default). command_format: is set explicitly so
@@ -20,7 +23,7 @@ rs485_frame:
         mode: escape_byte
         byte: 0x00
     crc:
-      type: sum16
+      type: sum16_big_endian
     tx:
       gate:
         frame_type: [0x01, 0x01]
@@ -147,6 +150,21 @@ rs485_frame:
       data_bits_sweep: [7, 8]
       dwell: 8s
 
+  # Hub 6 — sum16_little_endian CRC: compiles the little-endian 2-byte CRC read/emit branch
+  # for a sum (the counterpart to sum16_big_endian; same on-wire byte order as crc16_modbus).
+  - id: rs485_frame_hub6
+    uart_id: uart_bus
+    framing:
+      escape:
+        mode: escape_byte
+        byte: 0x00
+    crc:
+      type: sum16_little_endian
+    tx:
+      gate:
+        mode: idle_gap
+        min_silence: 15ms
+
 binary_sensor:
   # User RX decoding is done entirely through on_frame: + template sensors.
   - platform: template
@@ -169,7 +187,9 @@ text_sensor:
     name: "Last Frame Type"
 
 sensor:
-  # Diagnostic counters. publish_state deduplicates so steady-state buses don't spam.
+  # Diagnostic counters. The rs485_frame sensor platform gates its own publishes to
+  # on-change in loop() (sensor::publish_state does not dedupe), so a steady-state bus
+  # produces no repeat API traffic.
   - platform: rs485_frame
     rs485_frame_id: rs485_frame_hub
     name: "Frames Received"

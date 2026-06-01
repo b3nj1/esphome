@@ -71,8 +71,7 @@ class RS485FrameDiscovery {
   void analyze_burst_();
   // Process one extracted frame: interior bytes are b[inner_start, frame_end) (between the
   // opening STX and the closing DLE). Updates the escape histogram and CRC counters.
-  void analyze_frame_(const std::vector<uint8_t> &b, size_t inner_start, size_t frame_end, uint8_t dle, uint8_t stx,
-                      uint8_t etx);
+  void analyze_frame_(const std::vector<uint8_t> &b, size_t inner_start, size_t frame_end, uint8_t dle);
   void report_();
   static void bump_pair_(BytePair *table, size_t &len, uint8_t a, uint8_t b);
   static const BytePair *top_pair_(const BytePair *table, size_t len);

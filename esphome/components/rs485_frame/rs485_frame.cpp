@@ -22,8 +22,10 @@ static const char *crc_type_str(CrcType t) {
       return "none";
     case CRC_TYPE_SUM8:
       return "sum8";
-    case CRC_TYPE_SUM16:
-      return "sum16";
+    case CRC_TYPE_SUM16_BIG_ENDIAN:
+      return "sum16_big_endian";
+    case CRC_TYPE_SUM16_LITTLE_ENDIAN:
+      return "sum16_little_endian";
     case CRC_TYPE_XOR8:
       return "xor8";
     case CRC_TYPE_CRC16_MODBUS:
@@ -158,27 +160,38 @@ void RS485FrameHub::dump_config() {
   format_hex_to(gate_hex, this->tx_gate_frame_type_.data(), this->tx_gate_frame_type_.size());
   // escape_marker_ == dle_ means doubling mode (a literal DLE is stuffed as DLE DLE);
   // otherwise the marker is the dedicated escape byte emitted after a DLE.
-  char esc_desc[24];
+  const char *esc_desc_ptr;
+  char esc_desc_buf[16];
   if (this->escape_marker_ == this->dle_) {
-    snprintf(esc_desc, sizeof(esc_desc), "double (DLE DLE)");
+    esc_desc_ptr = "double (DLE DLE)";
   } else {
-    snprintf(esc_desc, sizeof(esc_desc), "byte 0x%02x", this->escape_marker_);
+    snprintf(esc_desc_buf, sizeof(esc_desc_buf), "byte 0x%02x", this->escape_marker_);
+    esc_desc_ptr = esc_desc_buf;
   }
   // Consolidated multi-line ESP_LOGCONFIG (matches modbus_server style) to save flash.
-  ESP_LOGCONFIG(
-      TAG,
-      "RS485 Frame:\n"
-      "  Framing: DLE=0x%02x STX=0x%02x ETX=0x%02x, escape: %s\n"
-      "  CRC type: %s, accept header CRC: %s, accept payload CRC: %s\n"
-      "  TX gate: %s, gate frame: %s, gate delay: %" PRIu32 "ms\n"
-      "  TX idle gap: %" PRIu32 "ms, TX interval: %" PRIu32 "ms\n"
-      "  Queue policy: %s, queue size: %" PRIu32 "\n"
-      "  Max frame length: %" PRIu32 ", frame timeout: %" PRIu32 "ms\n"
-      "  Sniffer only: %s, dump frames: %s",
-      this->dle_, this->stx_, this->etx_, esc_desc, crc_type_str(this->crc_type_), YESNO(this->accept_header_crc_),
-      YESNO(this->accept_payload_crc_), tx_gate_mode_str(this->tx_gate_mode_), gate_hex, this->tx_gate_delay_,
-      this->tx_idle_gap_, this->tx_fixed_interval_, queue_policy_str(this->queue_policy_), this->max_queue_size_,
-      this->max_frame_length_, this->in_frame_timeout_ms_, YESNO(this->sniffer_only_), YESNO(this->dump_frames_));
+  ESP_LOGCONFIG(TAG,
+                "RS485 Frame:\n"
+                "  Framing: DLE=0x%02x STX=0x%02x ETX=0x%02x, escape: %s\n"
+                "  CRC type: %s, TX CRC variant: %s, accept header CRC: %s, accept payload CRC: %s\n"
+                "  TX gate: %s, gate frame: %s, gate delay: %" PRIu32 "ms\n"
+                "  TX idle gap: %" PRIu32 "ms, TX interval: %" PRIu32 "ms\n"
+                "  Queue policy: %s, queue size: %" PRIu32 "\n"
+                "  Max frame length: %" PRIu32 ", frame timeout: %" PRIu32 "ms\n"
+                "  Sniffer only: %s, dump frames: %s",
+                this->dle_, this->stx_, this->etx_, esc_desc_ptr, crc_type_str(this->crc_type_),
+                this->tx_crc_variant_ == CRC_HEADER_INCLUSIVE ? "header_inclusive" : "payload_only",
+                YESNO(this->accept_header_crc_), YESNO(this->accept_payload_crc_),
+                tx_gate_mode_str(this->tx_gate_mode_), gate_hex, this->tx_gate_delay_, this->tx_idle_gap_,
+                this->tx_fixed_interval_, queue_policy_str(this->queue_policy_), this->max_queue_size_,
+                this->max_frame_length_, this->in_frame_timeout_ms_, YESNO(this->sniffer_only_),
+                YESNO(this->dump_frames_));
+  if (this->has_command_format_) {
+    ESP_LOGCONFIG(TAG, "  Command format: preamble=%zu bytes, size=%u, endian=%s, repeat=%u, postamble=%zu bytes",
+                  this->cmd_preamble_.size(), this->cmd_command_size_, this->cmd_big_endian_ ? "big" : "little",
+                  this->cmd_repeat_, this->cmd_postamble_.size());
+    if (this->has_idle_command_)
+      ESP_LOGCONFIG(TAG, "  Idle command: 0x%08" PRIx32, this->idle_command_);
+  }
 #ifdef USE_RS485_FRAME_DISCOVERY
   if (this->discovery_ != nullptr)
     ESP_LOGCONFIG(TAG, "  Discovery: ENABLED (framing/CRC/TX bypassed; passively analyzing raw traffic)");
@@ -381,7 +394,7 @@ bool RS485FrameHub::validate_frame_() {
   uint16_t received_crc = 0;
   if (crc_len == 1) {
     received_crc = this->rx_unescaped_.back();
-  } else if (this->crc_type_ == CRC_TYPE_CRC16_MODBUS) {
+  } else if (this->crc_little_endian_()) {
     received_crc =
         this->rx_unescaped_[this->rx_unescaped_.size() - 2] | (static_cast<uint16_t>(this->rx_unescaped_.back()) << 8);
   } else {
@@ -445,7 +458,8 @@ size_t RS485FrameHub::crc_length_() const {
     case CRC_TYPE_SUM8:
     case CRC_TYPE_XOR8:
       return 1;
-    case CRC_TYPE_SUM16:
+    case CRC_TYPE_SUM16_BIG_ENDIAN:
+    case CRC_TYPE_SUM16_LITTLE_ENDIAN:
     case CRC_TYPE_CRC16_MODBUS:
       return 2;
     default:
@@ -475,12 +489,14 @@ void RS485FrameHub::build_frame_(const std::vector<uint8_t> &payload, std::vecto
 
   size_t crc_len = this->crc_length_();
   if (crc_len > 0) {
+    // CRC is computed over the unescaped payload, then the CRC bytes are escaped like any other
+    // payload byte. Computing over escaped bytes is a common DLE-protocol bug; do not change order.
     uint16_t crc = this->calculate_crc_(payload, this->tx_crc_variant_ == CRC_HEADER_INCLUSIVE);
     uint8_t crc_bytes[2];
     size_t ncrc = 0;
     if (crc_len == 1) {
       crc_bytes[ncrc++] = crc & 0xFF;
-    } else if (this->crc_type_ == CRC_TYPE_CRC16_MODBUS) {
+    } else if (this->crc_little_endian_()) {
       crc_bytes[ncrc++] = crc & 0xFF;
       crc_bytes[ncrc++] = (crc >> 8) & 0xFF;
     } else {

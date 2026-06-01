@@ -40,14 +40,16 @@ static const CrcHypDef CRC_HYPS[] = {
     {ALGO_MODBUS, 2, true, false}, {ALGO_MODBUS, 2, false, true}, {ALGO_MODBUS, 2, false, false},
 };
 
-static const char *algo_name(CrcAlgo a) {
+// big_endian is only used for ALGO_SUM16 — the endianness is embedded in the name so the
+// caller does not need to add a separate "big-endian"/"little-endian" descriptor for it.
+static const char *algo_name(CrcAlgo a, bool big_endian = true) {
   switch (a) {
     case ALGO_SUM8:
       return "sum8";
     case ALGO_XOR8:
       return "xor8";
     case ALGO_SUM16:
-      return "sum16";
+      return big_endian ? "sum16_big_endian" : "sum16_little_endian";
     case ALGO_MODBUS:
       return "crc16_modbus";
     default:
@@ -292,15 +294,13 @@ void RS485FrameDiscovery::analyze_burst_() {
     }
     if (frame_end == SIZE_MAX)
       break;  // trailing partial frame with no terminator; stop scanning this burst
-    this->analyze_frame_(b, inner_start, frame_end, dle, stx, etx);
+    this->analyze_frame_(b, inner_start, frame_end, dle);
     i = frame_end + 2;  // resume past the closing DLE+ETX
   }
 }
 
 void RS485FrameDiscovery::analyze_frame_(const std::vector<uint8_t> &b, size_t inner_start, size_t frame_end,
-                                         uint8_t dle, uint8_t stx, uint8_t etx) {
-  (void) stx;
-  (void) etx;
+                                         uint8_t dle) {
   this->total_frames_++;
 
   // Escape histogram: within a single frame's interior every DLE is an escape, so the following
@@ -435,9 +435,14 @@ void RS485FrameDiscovery::report_() {
       if (samples >= need && this->crc_matches_[v][h] == samples) {
         any_crc = true;
         const char *cover = hyp.header ? "header_inclusive" : "payload_only";
-        if (hyp.width == 2) {
+        if (hyp.width == 2 && hyp.algo != ALGO_SUM16) {
+          // For non-sum16 2-byte CRCs (currently only ALGO_MODBUS), show endianness separately.
           ESP_LOGI(TAG, "  CRC match: %s %s %s (%s) - %" PRIu32 "/%" PRIu32 " frames", algo_name(hyp.algo), cover,
                    hyp.big_endian ? "big-endian" : "little-endian", view_name[v], this->crc_matches_[v][h], samples);
+        } else if (hyp.width == 2) {
+          // ALGO_SUM16: endianness is encoded in the name (sum16_big_endian / sum16_little_endian).
+          ESP_LOGI(TAG, "  CRC match: %s %s (%s) - %" PRIu32 "/%" PRIu32 " frames", algo_name(hyp.algo, hyp.big_endian),
+                   cover, view_name[v], this->crc_matches_[v][h], samples);
         } else {
           ESP_LOGI(TAG, "  CRC match: %s %s (%s) - %" PRIu32 "/%" PRIu32 " frames", algo_name(hyp.algo), cover,
                    view_name[v], this->crc_matches_[v][h], samples);
