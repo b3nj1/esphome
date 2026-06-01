@@ -113,7 +113,7 @@ class SnifferStats {
   // may be empty, in which case the d-ref column is always "-" (useful for protocols with
   // no obvious reference frame).
   void init(size_t max_entries, uint32_t interval_ms, uint8_t payload_dump_top, size_t max_unique_payloads,
-            size_t payload_capture_bytes, const std::vector<uint8_t> &reference_frame_type);
+            size_t payload_capture_bytes, const std::vector<uint8_t> &reference_frame_type, bool strip_high_bit);
 
   // Hot path. Called once per validated RX frame with the payload-relative bytes (frame
   // type at payload[0..N-1], data after). Returns immediately if init() was never called.
@@ -145,6 +145,7 @@ class SnifferStats {
   uint32_t last_dump_time_{0};
   uint32_t dropped_frame_types_{0};
   uint8_t payload_dump_top_{0};
+  bool strip_high_bit_{false};
   // Sized by the YAML schema; carried here so update_unique_payload_, find_or_create_,
   // and dump_payloads_ all reach the same numbers.
   size_t max_unique_payloads_{0};

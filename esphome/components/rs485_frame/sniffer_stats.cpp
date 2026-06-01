@@ -73,12 +73,14 @@ void SnifferEntry::reset_period_stats() {
 }
 
 void SnifferStats::init(size_t max_entries, uint32_t interval_ms, uint8_t payload_dump_top, size_t max_unique_payloads,
-                        size_t payload_capture_bytes, const std::vector<uint8_t> &reference_frame_type) {
+                        size_t payload_capture_bytes, const std::vector<uint8_t> &reference_frame_type,
+                        bool strip_high_bit) {
   size_t capped = max_entries > SNIFFER_MAX_FRAME_TYPES_UPPER ? SNIFFER_MAX_FRAME_TYPES_UPPER : max_entries;
   this->entries_.init(capped);
   this->reference_frame_type_.assign(reference_frame_type.begin(), reference_frame_type.end());
   this->interval_ms_ = interval_ms;
   this->payload_dump_top_ = payload_dump_top;
+  this->strip_high_bit_ = strip_high_bit;
   this->max_unique_payloads_ = max_unique_payloads;
   this->payload_capture_bytes_ = payload_capture_bytes;
   // Pre-allocate the hex/ASCII scratch buffers used by dump_payloads_ so dumps don't
@@ -265,9 +267,11 @@ void SnifferStats::dump_(uint32_t now) {
 
 void SnifferStats::dump_payloads_(size_t top_n, const uint8_t *order) const {
   // Hex/ASCII view of every captured unique payload for the top-N frame types by count.
-  // ASCII strips the high bit so Hayward display bytes (blink-flag = bit 7) render as
-  // their underlying character; non-printable bytes are rendered as '.'. Buffers are
-  // preallocated on SnifferStats so the dump path has no heap traffic.
+  // When ascii_strip_high_bit is set, bit 7 is masked before the printable-range gate so
+  // displays that pack an attribute flag (blink/inverse) into the high bit render as their
+  // underlying character. Off by default to avoid collapsing distinct 8-bit values on binary
+  // buses. Non-printable bytes are rendered as '.'. Buffers are preallocated on SnifferStats
+  // so the dump path has no heap traffic.
   for (size_t i = 0; i < top_n; i++) {
     const SnifferEntry &e = this->entries_[order[i]];
     if (e.unique_count == 0)
@@ -279,7 +283,7 @@ void SnifferStats::dump_payloads_(size_t top_n, const uint8_t *order) const {
         std::snprintf(this->hex_buf_.get() + b * 3, 4, "%02X ", p.bytes[b]);
       this->hex_buf_[p.len * 3] = '\0';
       for (uint8_t b = 0; b < p.len; b++) {
-        uint8_t c = p.bytes[b] & 0x7F;  // strip Hayward-style blink-bit before ASCII gating
+        uint8_t c = this->strip_high_bit_ ? (p.bytes[b] & 0x7F) : p.bytes[b];
         this->ascii_buf_[b] = (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '.';
       }
       this->ascii_buf_[p.len] = '\0';

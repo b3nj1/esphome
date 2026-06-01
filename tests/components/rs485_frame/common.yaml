@@ -100,6 +100,7 @@ rs485_frame:
       max_frame_types: 16
       payload_dump_top: 2
       reference_frame_type: [0x01, 0x01]
+      ascii_strip_high_bit: true
 
   # Hub 3 — generic raw hub with no command_format: target of the raw-form button and the
   # send_frame action, proving the raw transmit path works without any command_format. XOR8

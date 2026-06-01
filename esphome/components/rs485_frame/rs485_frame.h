@@ -143,8 +143,7 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   void set_max_queue_size(uint32_t size) { this->max_queue_size_ = size; }
   // Configure the generic command encoder. Preamble bytes are written first, then the
   // 32-bit command value serialised as command_size bytes (1/2/4) in the requested byte
-  // order, repeated command_repeat times, then the postamble bytes. All four legacy
-  // Hayward/Jandy formats are expressible as data via this interface.
+  // order, repeated command_repeat times, then the postamble bytes.
   void set_command_format(const std::vector<uint8_t> &preamble, uint8_t command_size, bool big_endian, uint8_t repeat,
                           const std::vector<uint8_t> &postamble) {
     this->cmd_preamble_.assign(preamble.begin(), preamble.end());
@@ -171,10 +170,10 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   // frame_type) from YAML alone without forking the component.
   void enable_sniffer_stats(size_t max_entries, uint32_t interval_ms, uint8_t payload_dump_top,
                             size_t max_unique_payloads, size_t payload_capture_bytes,
-                            const std::vector<uint8_t> &reference_frame_type) {
+                            const std::vector<uint8_t> &reference_frame_type, bool strip_high_bit) {
     this->sniffer_stats_ = std::make_unique<SnifferStats>();
     this->sniffer_stats_->init(max_entries, interval_ms, payload_dump_top, max_unique_payloads, payload_capture_bytes,
-                               reference_frame_type);
+                               reference_frame_type, strip_high_bit);
   }
 #endif
 

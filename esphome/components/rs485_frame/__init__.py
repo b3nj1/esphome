@@ -35,6 +35,7 @@ QueuePolicy = rs485_frame_ns.enum("QueuePolicy")
 TxGateMode = rs485_frame_ns.enum("TxGateMode")
 
 CONF_RS485_FRAME_ID = "rs485_frame_id"
+CONF_ASCII_STRIP_HIGH_BIT = "ascii_strip_high_bit"
 CONF_COMMAND_ENDIAN = "command_endian"
 CONF_COMMAND_FORMAT = "command_format"
 CONF_COMMAND_REPEAT = "command_repeat"
@@ -336,6 +337,10 @@ SNIFFER_STATS_SCHEMA = cv.Schema(
         # bus keep-alive) when omitted; supplied here when you want d-ref measured against
         # something other than the gate.
         cv.Optional(CONF_REFERENCE_FRAME_TYPE): validate_frame_type,
+        # Off by default so the preview shows raw byte values on binary buses where the high
+        # bit carries data. Enable for display-frame buses that pack an attribute flag (e.g.
+        # blink/inverse) into bit 7, so the underlying character renders instead of '.'.
+        cv.Optional(CONF_ASCII_STRIP_HIGH_BIT, default=False): cv.boolean,
     }
 )
 
@@ -577,6 +582,7 @@ async def to_code(config):
                 stats[CONF_MAX_UNIQUE_PAYLOADS],
                 stats[CONF_PAYLOAD_CAPTURE_BYTES],
                 ref,
+                stats[CONF_ASCII_STRIP_HIGH_BIT],
             )
         )
 
