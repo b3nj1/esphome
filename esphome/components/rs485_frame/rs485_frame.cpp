@@ -101,6 +101,20 @@ void RS485FrameHub::setup() {
   this->hex_log_buf_size_ = tx_slot_capacity * 2 + 1;
   this->hex_log_buf_ = std::make_unique<char[]>(this->hex_log_buf_size_);
 
+#ifdef USE_RS485_FRAME_SNIFFER_STATS
+  {
+    // Compute the on-wire time for one UART symbol: 1 start bit + data bits + parity bit (if
+    // any) + stop bits. Used by read_uart_() to dead-reckon each frame's arrival time.
+    uint32_t baud = this->parent_->get_baud_rate();
+    if (baud > 0) {
+      uint32_t bits = 1 + this->parent_->get_data_bits() + this->parent_->get_stop_bits() +
+                      (this->parent_->get_parity() != uart::UART_CONFIG_PARITY_NONE ? 1 : 0);
+      // Round to nearest µs.
+      this->byte_time_us_ = (bits * 1000000UL + baud / 2) / baud;
+    }
+  }
+#endif
+
 #ifdef USE_RS485_FRAME_DISCOVERY
   if (this->discovery_ != nullptr)
     this->discovery_->setup();
@@ -296,6 +310,21 @@ void RS485FrameHub::read_uart_(uint32_t now) {
       // of the pending DLE, not as a fresh DLE).
       this->after_dle_ = false;
       if (byte == this->etx_) {
+#ifdef USE_RS485_FRAME_SNIFFER_STATS
+        if (this->sniffer_stats_ != nullptr && this->byte_time_us_ > 0) {
+          // Dead-reckon this frame's arrival time. The bytes still in the FIFO arrived after
+          // this frame's ETX, so the ETX arrived approximately (available() * byte_time_us_)
+          // µs before now. This separates frames that were batched in the same loop() call
+          // from having the identical timestamp, giving non-zero d-ref / d-same minimums.
+          // The estimate is a lower bound: inter-frame idle gaps on the bus are invisible in
+          // the FIFO byte count, so the true frame age is >= our estimate.
+          uint32_t fifo_after = static_cast<uint32_t>(this->available());
+          uint32_t age_ms = (fifo_after * this->byte_time_us_ + 500) / 1000;
+          this->stats_frame_now_ = (age_ms <= now) ? now - age_ms : 0;
+        } else {
+          this->stats_frame_now_ = now;
+        }
+#endif
         this->process_raw_frame_(now);
         this->in_frame_ = false;
         this->raw_frame_.clear();
@@ -339,7 +368,7 @@ void RS485FrameHub::process_raw_frame_(uint32_t now) {
 
 #ifdef USE_RS485_FRAME_SNIFFER_STATS
   if (this->sniffer_stats_ != nullptr)
-    this->sniffer_stats_->record(this->rx_payload_, now);
+    this->sniffer_stats_->record(this->rx_payload_, this->stats_frame_now_);
 #endif
 
   for (auto *trigger : this->triggers_) {

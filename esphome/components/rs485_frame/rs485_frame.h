@@ -343,6 +343,17 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   // nullptr unless sniffer_stats: was present in YAML. The hot path is a single null check
   // in process_raw_frame_; production builds (without the define) pay no cost at all.
   std::unique_ptr<SnifferStats> sniffer_stats_;
+  // Microseconds per UART symbol (start + data + parity + stop bits), computed once in
+  // setup() from the parent UARTComponent's baud rate and framing. Used by read_uart_() to
+  // dead-reckon each frame's arrival time from the number of FIFO bytes that follow it:
+  // the frame's last byte arrived approximately (available() * byte_time_us_) µs before now,
+  // giving per-frame timestamps that separate frames batched in the same loop() iteration.
+  uint32_t byte_time_us_{0};
+  // Per-frame dead-reckoned timestamp written by read_uart_() just before it calls
+  // process_raw_frame_(), and consumed by process_raw_frame_() for the sniffer record() call.
+  // Kept as a field (rather than a second function parameter) to avoid changing the signature
+  // of process_raw_frame_() solely for the stats path.
+  uint32_t stats_frame_now_{0};
 #endif
 
 #ifdef USE_RS485_FRAME_DISCOVERY
