@@ -368,7 +368,7 @@ void RS485FrameHub::process_raw_frame_(uint32_t now) {
 
 #ifdef USE_RS485_FRAME_SNIFFER_STATS
   if (this->sniffer_stats_ != nullptr)
-    this->sniffer_stats_->record(this->rx_payload_, this->stats_frame_now_);
+    this->sniffer_stats_->record(this->rx_payload_, now, this->stats_frame_now_);
 #endif
 
   for (auto *trigger : this->triggers_) {

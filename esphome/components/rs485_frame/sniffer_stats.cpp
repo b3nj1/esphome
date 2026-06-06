@@ -138,16 +138,17 @@ void SnifferStats::update_unique_payload_(SnifferEntry &e, const std::vector<uin
   }
 }
 
-void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t now) {
+void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t loop_now, uint32_t frame_now) {
   if (!this->initialized_ || payload.size() < 2)
     return;
 
-  // Update the reference-frame timestamp *before* computing since-ref for this frame so
+  // Update the reference-frame timestamps *before* computing since-ref for this frame so
   // that the reference frame itself shows up with no since-ref sample (its own d-ref row
   // is always "-"), and the next non-reference frame measures from this one.
   bool is_ref = this->matches_reference_(payload);
   if (is_ref) {
-    this->last_ref_time_ = now;
+    this->last_ref_time_ = frame_now;
+    this->last_ref_loop_now_ = loop_now;
     this->ref_seen_in_period_ = true;
   }
 
@@ -161,19 +162,33 @@ void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t now) {
   // since-same-type: only after we've seen this frame type at least once in this period.
   if (e->count > 0) {
     // Unsigned subtraction wraps correctly for the 49-day millis rollover.
-    e->d_same.add(now - e->last_seen_ms);
+    e->d_same.add(frame_now - e->last_seen_ms);
   }
 
   // since-ref: skip when this frame is the reference itself (the d-ref column would be
   // always zero and is uninformative for the reference row).
   if (this->ref_seen_in_period_ && !is_ref) {
-    e->d_ref.add(now - this->last_ref_time_);
+    // Two cases depending on whether this frame and the reference frame were processed in
+    // the same loop() call (same-batch) or different calls (cross-batch):
+    //
+    // Same-batch (loop_now == last_ref_loop_now_): both dead-reckoned timestamps are
+    // anchored to the same loop_now, so their FIFO-age errors cancel in the subtraction.
+    // Use frame_now - last_ref_time_ for an accurate intra-batch delta.
+    //
+    // Cross-batch (loop_now != last_ref_loop_now_): using last_ref_time_ (dead-reckoned,
+    // pushed backward by the FIFO bytes that followed the reference frame) inflates d_ref
+    // by that over-estimated age. Instead subtract last_ref_loop_now_ (the raw loop start
+    // when the reference was seen), so d_ref = frame_now - last_ref_loop_now_ ≈ inter-loop
+    // gap minus the current frame's own dead-reckoning correction — an accurate measure of
+    // how long after the reference loop this frame arrived.
+    uint32_t ref_base = (loop_now == this->last_ref_loop_now_) ? this->last_ref_time_ : this->last_ref_loop_now_;
+    e->d_ref.add(frame_now - ref_base);
   }
 
   this->update_unique_payload_(*e, payload);
 
   e->count++;
-  e->last_seen_ms = now;
+  e->last_seen_ms = frame_now;
 }
 
 void SnifferStats::tick(uint32_t now) {

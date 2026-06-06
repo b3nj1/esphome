@@ -117,7 +117,12 @@ class SnifferStats {
 
   // Hot path. Called once per validated RX frame with the payload-relative bytes (frame
   // type at payload[0..N-1], data after). Returns immediately if init() was never called.
-  void record(const std::vector<uint8_t> &payload, uint32_t now);
+  // loop_now  — raw App.get_loop_component_start_time(), the same for every frame processed
+  //             in one loop() call. Used to detect same-batch vs cross-batch frame pairs.
+  // frame_now — dead-reckoned per-frame estimate (loop_now minus FIFO trailing bytes *
+  //             byte_time_us). Gives non-zero timing within a batch; equals loop_now when
+  //             the frame is the last thing in the FIFO.
+  void record(const std::vector<uint8_t> &payload, uint32_t loop_now, uint32_t frame_now);
 
   // Called from the hub's loop(). Emits the table if interval_ms has elapsed since the
   // last dump, then resets per-period counters.
@@ -139,7 +144,14 @@ class SnifferStats {
 
   FixedVector<SnifferEntry> entries_;
   StaticVector<uint8_t, SNIFFER_REFERENCE_MAX_LEN> reference_frame_type_;
+  // Dead-reckoned timestamp of the most recent reference frame (used for same-batch d_ref,
+  // where both sides of the subtraction are dead-reckoned so the per-frame FIFO errors cancel).
   uint32_t last_ref_time_{0};
+  // Raw loop-start time when the most recent reference frame was processed. Used for
+  // cross-batch d_ref: subtracting a raw loop timestamp from a dead-reckoned frame_now
+  // correctly measures the inter-loop gap minus the current frame's FIFO age, rather than
+  // inflating d_ref by the reference frame's over-estimated FIFO age.
+  uint32_t last_ref_loop_now_{0};
   bool ref_seen_in_period_{false};
   uint32_t interval_ms_{0};
   uint32_t last_dump_time_{0};
