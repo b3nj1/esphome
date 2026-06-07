@@ -13,6 +13,34 @@ namespace esphome::rs485_frame {
 
 static const char *const TAG = "rs485_frame.stats";
 
+void SnifferHistogram::add(size_t value) {
+  if (value == 0) {
+    this->buckets[0]++;
+    return;
+  }
+  uint8_t bucket = 1;
+  size_t limit = 1;
+  while (bucket + 1 < SNIFFER_HISTOGRAM_BUCKETS && value > limit) {
+    limit <<= 1;
+    bucket++;
+  }
+  this->buckets[bucket]++;
+}
+
+void SnifferTimingStats::add(uint32_t value) {
+  if (this->count < UINT32_MAX)
+    this->count++;
+  this->sum += value;
+  if (value < this->min)
+    this->min = value;
+  if (value > this->max)
+    this->max = value;
+}
+
+uint32_t SnifferTimingStats::mean() const {
+  return this->count == 0 ? 0 : static_cast<uint32_t>(this->sum / this->count);
+}
+
 void DelayStats::reset() {
   this->min = UINT32_MAX;
   this->max = 0;
@@ -62,7 +90,7 @@ void SnifferEntry::init(size_t max_unique_payloads, size_t payload_capture_bytes
 
 void SnifferEntry::reset_period_stats() {
   this->count = 0;
-  this->last_seen_ms = 0;
+  this->last_seen_us = 0;
   this->d_ref.reset();
   this->d_same.reset();
   // Wipe the unique-payload bookkeeping so the next period starts fresh. The payload
@@ -138,7 +166,41 @@ void SnifferStats::update_unique_payload_(SnifferEntry &e, const std::vector<uin
   }
 }
 
-void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t loop_now, uint32_t frame_now) {
+void SnifferStats::loop_start(uint32_t loop_start_us, size_t uart_available) {
+  if (!this->initialized_)
+    return;
+  this->uart_available_start_.add(uart_available);
+  if (this->loop_count_ > 0)
+    this->loop_intercall_us_.add(loop_start_us - this->last_loop_start_us_);
+  this->last_loop_start_us_ = loop_start_us;
+  if (this->loop_count_ < UINT32_MAX)
+    this->loop_count_++;
+}
+
+void SnifferStats::loop_end(uint32_t loop_duration_us, uint32_t frames_seen, uint32_t rx_bytes_seen,
+                            uint32_t byte_time_us) {
+  if (!this->initialized_)
+    return;
+  this->loop_duration_us_.add(loop_duration_us);
+  this->frames_per_loop_.add(frames_seen);
+  this->rx_bytes_total_ += rx_bytes_seen;
+  this->rx_busy_us_ += static_cast<uint64_t>(rx_bytes_seen) * byte_time_us;
+}
+
+void SnifferStats::record_fifo_after_etx(size_t fifo_after, uint32_t correction_us) {
+  if (!this->initialized_)
+    return;
+  this->fifo_after_etx_.add(fifo_after);
+  this->dead_reckon_correction_us_.add(correction_us);
+}
+
+void SnifferStats::record_tx_lateness(uint32_t lateness_us) {
+  if (!this->initialized_)
+    return;
+  this->tx_lateness_us_.add(lateness_us);
+}
+
+void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t loop_now_us, uint32_t frame_now_us) {
   if (!this->initialized_ || payload.size() < 2)
     return;
 
@@ -147,8 +209,8 @@ void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t loop_now
   // is always "-"), and the next non-reference frame measures from this one.
   bool is_ref = this->matches_reference_(payload);
   if (is_ref) {
-    this->last_ref_time_ = frame_now;
-    this->last_ref_loop_now_ = loop_now;
+    this->last_ref_time_ = frame_now_us;
+    this->last_ref_loop_now_ = loop_now_us;
     this->ref_seen_in_period_ = true;
   }
 
@@ -161,8 +223,7 @@ void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t loop_now
 
   // since-same-type: only after we've seen this frame type at least once in this period.
   if (e->count > 0) {
-    // Unsigned subtraction wraps correctly for the 49-day millis rollover.
-    e->d_same.add(frame_now - e->last_seen_ms);
+    e->d_same.add((frame_now_us - e->last_seen_us + 500) / 1000);
   }
 
   // since-ref: skip when this frame is the reference itself (the d-ref column would be
@@ -181,14 +242,14 @@ void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t loop_now
     // when the reference was seen), so d_ref = frame_now - last_ref_loop_now_ ≈ inter-loop
     // gap minus the current frame's own dead-reckoning correction — an accurate measure of
     // how long after the reference loop this frame arrived.
-    uint32_t ref_base = (loop_now == this->last_ref_loop_now_) ? this->last_ref_time_ : this->last_ref_loop_now_;
-    e->d_ref.add(frame_now - ref_base);
+    uint32_t ref_base = (loop_now_us == this->last_ref_loop_now_) ? this->last_ref_time_ : this->last_ref_loop_now_;
+    e->d_ref.add((frame_now_us - ref_base + 500) / 1000);
   }
 
   this->update_unique_payload_(*e, payload);
 
   e->count++;
-  e->last_seen_ms = frame_now;
+  e->last_seen_us = frame_now_us;
 }
 
 void SnifferStats::tick(uint32_t now) {
@@ -198,6 +259,7 @@ void SnifferStats::tick(uint32_t now) {
     // First tick after init — establish baseline so the first dump fires ~interval_ms
     // after sniffer start rather than immediately.
     this->last_dump_time_ = now;
+    this->first_loop_ms_ = now;
     return;
   }
   if (now - this->last_dump_time_ < this->interval_ms_)
@@ -269,6 +331,7 @@ void SnifferStats::dump_(uint32_t now) {
     ESP_LOGW(TAG, "  dropped %" PRIu32 " events for frame types past table capacity (%zu)", this->dropped_frame_types_,
              this->entries_.capacity());
   }
+  this->dump_processing_stats_(now);
 
   // Per-period reset: total frame count, delay stats, AND unique payload list. The
   // payload list is intentionally cleared every period so the user can use successive
@@ -278,6 +341,55 @@ void SnifferStats::dump_(uint32_t now) {
     this->entries_[i].reset_period_stats();
   this->dropped_frame_types_ = 0;
   this->ref_seen_in_period_ = false;
+}
+
+void SnifferStats::dump_processing_stats_(uint32_t now) const {
+  uint32_t elapsed_ms = now - this->first_loop_ms_;
+  uint32_t rx_duty_per_mille =
+      elapsed_ms == 0
+          ? 0
+          : static_cast<uint32_t>((this->rx_busy_us_ * 1000ULL) / (static_cast<uint64_t>(elapsed_ms) * 1000ULL));
+  ESP_LOGI(TAG,
+           "  processing lifetime: loops=%" PRIu32 " mean_loop_gap=%" PRIu32 "us mean_loop=%" PRIu32
+           "us rx_bytes=%" PRIu64 " rx_duty=%" PRIu32 ".%01" PRIu32 "%%",
+           this->loop_count_, this->loop_intercall_us_.mean(), this->loop_duration_us_.mean(), this->rx_bytes_total_,
+           rx_duty_per_mille / 10, rx_duty_per_mille % 10);
+  ESP_LOGI(TAG, "  loop gap us min/mean/max: %" PRIu32 " / %" PRIu32 " / %" PRIu32,
+           this->loop_intercall_us_.count == 0 ? 0 : this->loop_intercall_us_.min, this->loop_intercall_us_.mean(),
+           this->loop_intercall_us_.max);
+  ESP_LOGI(TAG, "  loop duration us min/mean/max: %" PRIu32 " / %" PRIu32 " / %" PRIu32,
+           this->loop_duration_us_.count == 0 ? 0 : this->loop_duration_us_.min, this->loop_duration_us_.mean(),
+           this->loop_duration_us_.max);
+  ESP_LOGI(TAG, "  dead-reckon correction us min/mean/max: %" PRIu32 " / %" PRIu32 " / %" PRIu32,
+           this->dead_reckon_correction_us_.count == 0 ? 0 : this->dead_reckon_correction_us_.min,
+           this->dead_reckon_correction_us_.mean(), this->dead_reckon_correction_us_.max);
+  if (this->tx_lateness_us_.count > 0) {
+    ESP_LOGI(TAG, "  tx_lateness_us min/mean/max: %" PRIu32 " / %" PRIu32 " / %" PRIu32 " (n=%" PRIu32 ")",
+             this->tx_lateness_us_.min, this->tx_lateness_us_.mean(), this->tx_lateness_us_.max,
+             this->tx_lateness_us_.count);
+  }
+  ESP_LOGI(TAG,
+           "  hist uart_start bytes [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32
+           " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
+           this->uart_available_start_.buckets[0], this->uart_available_start_.buckets[1],
+           this->uart_available_start_.buckets[2], this->uart_available_start_.buckets[3],
+           this->uart_available_start_.buckets[4], this->uart_available_start_.buckets[5],
+           this->uart_available_start_.buckets[6], this->uart_available_start_.buckets[7],
+           this->uart_available_start_.buckets[8], this->uart_available_start_.buckets[9]);
+  ESP_LOGI(TAG,
+           "  hist frames_per_loop [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32
+           " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
+           this->frames_per_loop_.buckets[0], this->frames_per_loop_.buckets[1], this->frames_per_loop_.buckets[2],
+           this->frames_per_loop_.buckets[3], this->frames_per_loop_.buckets[4], this->frames_per_loop_.buckets[5],
+           this->frames_per_loop_.buckets[6], this->frames_per_loop_.buckets[7], this->frames_per_loop_.buckets[8],
+           this->frames_per_loop_.buckets[9]);
+  ESP_LOGI(TAG,
+           "  hist fifo_after_etx bytes [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32
+           " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
+           this->fifo_after_etx_.buckets[0], this->fifo_after_etx_.buckets[1], this->fifo_after_etx_.buckets[2],
+           this->fifo_after_etx_.buckets[3], this->fifo_after_etx_.buckets[4], this->fifo_after_etx_.buckets[5],
+           this->fifo_after_etx_.buckets[6], this->fifo_after_etx_.buckets[7], this->fifo_after_etx_.buckets[8],
+           this->fifo_after_etx_.buckets[9]);
 }
 
 void SnifferStats::dump_payloads_(size_t top_n, const uint8_t *order) const {

@@ -30,6 +30,23 @@ static constexpr size_t SNIFFER_MAX_FRAME_TYPES_UPPER = 64;
 // Upper bound for the reference frame_type length. Matches MAX_FRAME_TYPE_LEN in
 // rs485_frame.h but duplicated here so this header has no dependency on the hub header.
 static constexpr size_t SNIFFER_REFERENCE_MAX_LEN = 8;
+static constexpr size_t SNIFFER_HISTOGRAM_BUCKETS = 10;
+
+struct SnifferHistogram {
+  uint32_t buckets[SNIFFER_HISTOGRAM_BUCKETS]{};
+
+  void add(size_t value);
+};
+
+struct SnifferTimingStats {
+  uint64_t sum{0};
+  uint32_t count{0};
+  uint32_t min{UINT32_MAX};
+  uint32_t max{0};
+
+  void add(uint32_t value);
+  uint32_t mean() const;
+};
 
 // Per-frame-type sliding-window stats for the inter-arrival delay between bus frames.
 // Tracks exact min/max across the dump period plus a small ring buffer of recent samples
@@ -74,7 +91,7 @@ struct PayloadCapture {
 struct SnifferEntry {
   uint8_t frame_type[2]{};
   uint32_t count{0};
-  uint32_t last_seen_ms{0};
+  uint32_t last_seen_us{0};
   DelayStats d_ref;
   DelayStats d_same;
   // Heap-allocated array of PayloadCapture slots, sized to SnifferStats::max_unique_payloads_
@@ -115,14 +132,19 @@ class SnifferStats {
   void init(size_t max_entries, uint32_t interval_ms, uint8_t payload_dump_top, size_t max_unique_payloads,
             size_t payload_capture_bytes, const std::vector<uint8_t> &reference_frame_type, bool strip_high_bit);
 
+  void loop_start(uint32_t loop_start_us, size_t uart_available);
+  void loop_end(uint32_t loop_duration_us, uint32_t frames_seen, uint32_t rx_bytes_seen, uint32_t byte_time_us);
+  void record_fifo_after_etx(size_t fifo_after, uint32_t correction_us);
+  // Called when a deferred TX frame fires. lateness_us = micros() - tx_start_at_us_ at the
+  // moment the frame is written; quantifies how much the cooperative loop delayed the send.
+  void record_tx_lateness(uint32_t lateness_us);
+
   // Hot path. Called once per validated RX frame with the payload-relative bytes (frame
   // type at payload[0..N-1], data after). Returns immediately if init() was never called.
-  // loop_now  — raw App.get_loop_component_start_time(), the same for every frame processed
-  //             in one loop() call. Used to detect same-batch vs cross-batch frame pairs.
-  // frame_now — dead-reckoned per-frame estimate (loop_now minus FIFO trailing bytes *
-  //             byte_time_us). Gives non-zero timing within a batch; equals loop_now when
-  //             the frame is the last thing in the FIFO.
-  void record(const std::vector<uint8_t> &payload, uint32_t loop_now, uint32_t frame_now);
+  // loop_now_us  — micros() sampled at the top of this component loop.
+  // frame_now_us — dead-reckoned ETX timestamp from micros() at ETX processing minus the
+  //                UART bytes still buffered after the frame.
+  void record(const std::vector<uint8_t> &payload, uint32_t loop_now_us, uint32_t frame_now_us);
 
   // Called from the hub's loop(). Emits the table if interval_ms has elapsed since the
   // last dump, then resets per-period counters.
@@ -141,13 +163,13 @@ class SnifferStats {
   void update_unique_payload_(SnifferEntry &e, const std::vector<uint8_t> &payload);
   void dump_(uint32_t now);
   void dump_payloads_(size_t top_n, const uint8_t *order) const;
+  void dump_processing_stats_(uint32_t now) const;
 
   FixedVector<SnifferEntry> entries_;
   StaticVector<uint8_t, SNIFFER_REFERENCE_MAX_LEN> reference_frame_type_;
-  // Dead-reckoned timestamp of the most recent reference frame (used for same-batch d_ref,
-  // where both sides of the subtraction are dead-reckoned so the per-frame FIFO errors cancel).
+  // Dead-reckoned micros() timestamp of the most recent reference frame.
   uint32_t last_ref_time_{0};
-  // Raw loop-start time when the most recent reference frame was processed. Used for
+  // Raw loop-start micros() when the most recent reference frame was processed. Used for
   // cross-batch d_ref: subtracting a raw loop timestamp from a dead-reckoned frame_now
   // correctly measures the inter-loop gap minus the current frame's FIFO age, rather than
   // inflating d_ref by the reference frame's over-estimated FIFO age.
@@ -156,6 +178,18 @@ class SnifferStats {
   uint32_t interval_ms_{0};
   uint32_t last_dump_time_{0};
   uint32_t dropped_frame_types_{0};
+  SnifferHistogram uart_available_start_;
+  SnifferHistogram frames_per_loop_;
+  SnifferHistogram fifo_after_etx_;
+  SnifferTimingStats loop_intercall_us_;
+  SnifferTimingStats loop_duration_us_;
+  SnifferTimingStats dead_reckon_correction_us_;
+  SnifferTimingStats tx_lateness_us_;
+  uint32_t last_loop_start_us_{0};
+  uint32_t loop_count_{0};
+  uint64_t rx_busy_us_{0};
+  uint64_t rx_bytes_total_{0};
+  uint32_t first_loop_ms_{0};
   uint8_t payload_dump_top_{0};
   bool strip_high_bit_{false};
   // Sized by the YAML schema; carried here so update_unique_payload_, find_or_create_,
