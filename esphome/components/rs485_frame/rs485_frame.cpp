@@ -101,17 +101,16 @@ void RS485FrameHub::setup() {
   this->hex_log_buf_size_ = tx_slot_capacity * 2 + 1;
   this->hex_log_buf_ = std::make_unique<char[]>(this->hex_log_buf_size_);
 
-  {
-    // Compute the on-wire time for one UART symbol: 1 start bit + data bits + parity bit (if
-    // any) + stop bits. Used by read_uart_() to dead-reckon each frame's ETX time.
+#ifdef USE_RS485_FRAME_SNIFFER_STATS
+  if (this->sniffer_stats_ != nullptr) {
     uint32_t baud = this->parent_->get_baud_rate();
     if (baud > 0) {
       uint32_t bits = 1 + this->parent_->get_data_bits() + this->parent_->get_stop_bits() +
                       (this->parent_->get_parity() != uart::UART_CONFIG_PARITY_NONE ? 1 : 0);
-      // Round to nearest µs.
       this->byte_time_us_ = (bits * 1000000UL + baud / 2) / baud;
     }
   }
+#endif
 
 #ifdef USE_RS485_FRAME_DISCOVERY
   if (this->discovery_ != nullptr)
@@ -121,7 +120,6 @@ void RS485FrameHub::setup() {
 
 void RS485FrameHub::loop() {
   const uint32_t now = App.get_loop_component_start_time();
-  this->loop_start_us_ = micros();
 
 #ifdef USE_RS485_FRAME_DISCOVERY
   if (this->discovery_ != nullptr) {
@@ -137,9 +135,9 @@ void RS485FrameHub::loop() {
 
 #ifdef USE_RS485_FRAME_SNIFFER_STATS
   if (this->sniffer_stats_ != nullptr) {
+    this->loop_start_us_ = micros();
     this->loop_rx_bytes_ = 0;
-    this->loop_frames_ = 0;
-    this->sniffer_stats_->loop_start(this->loop_start_us_, this->available());
+    this->sniffer_stats_->loop_start(this->loop_start_us_);
   }
 #endif
 
@@ -180,8 +178,7 @@ void RS485FrameHub::loop() {
 
 #ifdef USE_RS485_FRAME_SNIFFER_STATS
   if (this->sniffer_stats_ != nullptr) {
-    this->sniffer_stats_->loop_end(micros() - this->loop_start_us_, this->loop_frames_, this->loop_rx_bytes_,
-                                   this->byte_time_us_);
+    this->sniffer_stats_->loop_end(micros() - this->loop_start_us_, this->loop_rx_bytes_, this->byte_time_us_);
     this->sniffer_stats_->tick(now);
   }
 #endif
@@ -333,14 +330,12 @@ void RS485FrameHub::read_uart_(uint32_t now) {
       // of the pending DLE, not as a fresh DLE).
       this->after_dle_ = false;
       if (byte == this->etx_) {
-        uint32_t fifo_after = static_cast<uint32_t>(this->available());
-        uint32_t correction_us = fifo_after * this->byte_time_us_;
-        this->rx_frame_time_us_ = micros() - correction_us;
+        size_t fifo_after = static_cast<size_t>(this->available());
 #ifdef USE_RS485_FRAME_SNIFFER_STATS
         if (this->sniffer_stats_ != nullptr)
-          this->sniffer_stats_->record_fifo_after_etx(fifo_after, correction_us);
+          this->sniffer_stats_->record_fifo_after_etx(fifo_after);
 #endif
-        this->process_raw_frame_(now);
+        this->process_raw_frame_(now, fifo_after);
         this->in_frame_ = false;
         this->raw_frame_.clear();
       }
@@ -353,19 +348,9 @@ void RS485FrameHub::read_uart_(uint32_t now) {
     // spuriously start a new frame.
     this->previous_byte_ = byte;
   }
-#ifdef USE_RS485_FRAME_SNIFFER_STATS
-  // If we exited mid-frame, check whether the partial frame matches the reference type.
-  // raw_frame_ layout: [0]=DLE [1]=STX [2..N]=payload bytes so far. We skip past the
-  // DLE+STX header and compare the payload prefix against the reference frame type.
-  // Each such event is a full loop() round-trip added to TX scheduling latency; the
-  // counter lets users see whether the gate frame is reliably arriving in a single loop
-  // or is routinely split across two or more calls.
-  if (this->sniffer_stats_ != nullptr && this->in_frame_ && this->raw_frame_.size() > 2)
-    this->sniffer_stats_->record_partial_ref_frame(this->raw_frame_.data() + 2, this->raw_frame_.size() - 2);
-#endif
 }
 
-void RS485FrameHub::process_raw_frame_(uint32_t now) {
+void RS485FrameHub::process_raw_frame_(uint32_t now, size_t fifo_after) {
   if (!this->validate_frame_()) {
     this->crc_failures_++;
     return;
@@ -388,14 +373,12 @@ void RS485FrameHub::process_raw_frame_(uint32_t now) {
     this->last_ka_seen_ = true;
     this->last_ka_time_ = now;
     if (this->tx_gate_mode_ == TX_GATE_FRAME_TRIGGER)
-      this->send_next_(now, this->rx_frame_time_us_ + this->tx_gate_delay_ * 1000UL);
+      this->send_next_(now);
   }
 
 #ifdef USE_RS485_FRAME_SNIFFER_STATS
   if (this->sniffer_stats_ != nullptr) {
-    if (this->loop_frames_ < UINT32_MAX)
-      this->loop_frames_++;
-    this->sniffer_stats_->record(this->rx_payload_, this->loop_start_us_, this->rx_frame_time_us_);
+    this->sniffer_stats_->record(this->rx_payload_, this->loop_start_us_, fifo_after);
   }
 #endif
 
@@ -640,12 +623,12 @@ void RS485FrameHub::write_frame_(const std::vector<uint8_t> &frame) {
   }
 }
 
-void RS485FrameHub::send_next_(uint32_t now, uint32_t due_us) {
+void RS485FrameHub::send_next_(uint32_t now) {
   if (this->sniffer_only_ || this->tx_start_pending_)
     return;
   if (this->queue_size_() == 0) {
     if (this->has_idle_command_)
-      this->send_next_idle_(now, due_us);
+      this->send_next_idle_(now);
     return;
   }
 
@@ -653,7 +636,7 @@ void RS485FrameHub::send_next_(uint32_t now, uint32_t due_us) {
     // Swap the frame into pending_tx_frame_ — both are pre-reserved, no allocation.
     std::swap(this->pending_tx_frame_, this->tx_queue_[this->tx_queue_head_]);
     this->queue_pop_front_();
-    this->tx_start_at_us_ = due_us == 0 ? micros() + this->tx_gate_delay_ * 1000UL : due_us;
+    this->tx_start_at_us_ = micros() + this->tx_gate_delay_ * 1000UL;
     this->tx_start_pending_ = true;
     this->pending_is_idle_ = false;
     return;
@@ -665,12 +648,12 @@ void RS485FrameHub::send_next_(uint32_t now, uint32_t due_us) {
   this->commands_sent_++;
 }
 
-void RS485FrameHub::send_next_idle_(uint32_t now, uint32_t due_us) {
+void RS485FrameHub::send_next_idle_(uint32_t now) {
   this->build_key_payload_(this->idle_command_, this->tx_payload_buf_);
   this->build_frame_(this->tx_payload_buf_, this->tx_frame_buf_);
   if (this->tx_gate_delay_ > 0) {
     std::swap(this->pending_tx_frame_, this->tx_frame_buf_);
-    this->tx_start_at_us_ = due_us == 0 ? micros() + this->tx_gate_delay_ * 1000UL : due_us;
+    this->tx_start_at_us_ = micros() + this->tx_gate_delay_ * 1000UL;
     this->tx_start_pending_ = true;
     this->pending_is_idle_ = true;
     return;

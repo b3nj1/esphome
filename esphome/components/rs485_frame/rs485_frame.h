@@ -212,7 +212,7 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
 
  protected:
   void read_uart_(uint32_t now);
-  void process_raw_frame_(uint32_t now);
+  void process_raw_frame_(uint32_t now, size_t fifo_after);
   bool validate_frame_();
   uint16_t calculate_crc_(const std::vector<uint8_t> &payload, bool include_header) const;
   size_t crc_length_() const;
@@ -225,8 +225,8 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   void build_key_payload_(uint32_t command, std::vector<uint8_t> &out) const;
   bool enqueue_frame_();
   void maybe_tx_(uint32_t now);
-  void send_next_(uint32_t now, uint32_t due_us = 0);
-  void send_next_idle_(uint32_t now, uint32_t due_us = 0);
+  void send_next_(uint32_t now);
+  void send_next_idle_(uint32_t now);
   bool frame_type_equals_(const std::vector<uint8_t> &payload,
                           const StaticVector<uint8_t, MAX_FRAME_TYPE_LEN> &frame_type) const;
   void update_last_frame_type_();
@@ -339,23 +339,15 @@ class RS485FrameHub : public Component, public uart::UARTDevice {
   // frame_type prefixes still match correctly but the diagnostic only shows the first two.
   char last_frame_type_[5]{};
 
-  // Microseconds per UART symbol (start + data + parity + stop bits), computed once in
-  // setup() from the parent UARTComponent's baud rate and framing. Used by read_uart_() to
-  // dead-reckon each frame's arrival time from the number of FIFO bytes that follow it:
-  // the frame's last byte arrived approximately (available() * byte_time_us_) µs before now,
-  // giving per-frame timestamps that separate frames batched in the same loop() iteration.
-  uint32_t byte_time_us_{0};
-  // Dead-reckoned ETX timestamp for the frame currently being validated. Used by production
-  // frame-trigger gating and, when enabled, sniffer timing stats.
-  uint32_t rx_frame_time_us_{0};
-  uint32_t loop_start_us_{0};
-
 #ifdef USE_RS485_FRAME_SNIFFER_STATS
   // nullptr unless sniffer_stats: was present in YAML. The hot path is a single null check
   // in process_raw_frame_; production builds (without the define) pay no cost at all.
   std::unique_ptr<SnifferStats> sniffer_stats_;
+  uint32_t loop_start_us_{0};
+  // Microseconds per UART symbol: 1 start + data_bits + parity + stop_bits. Computed once
+  // in setup() and used by loop_end() to estimate RX duty cycle.
+  uint32_t byte_time_us_{0};
   uint32_t loop_rx_bytes_{0};
-  uint32_t loop_frames_{0};
 #endif
 
 #ifdef USE_RS485_FRAME_DISCOVERY

@@ -166,20 +166,9 @@ void SnifferStats::update_unique_payload_(SnifferEntry &e, const std::vector<uin
   }
 }
 
-void SnifferStats::loop_start(uint32_t loop_start_us, size_t uart_available) {
+void SnifferStats::loop_start(uint32_t loop_start_us) {
   if (!this->initialized_)
     return;
-  this->uart_available_start_.add(uart_available);
-  // Buffer for the reference-frame histogram (consumed in record() if a ref frame is seen).
-  this->last_loop_uart_available_ = uart_available;
-  // If the previous loop exited mid-reference-frame, measure how long it took to get back.
-  // The gap is in microseconds; convert to ms (rounded) for the histogram so the log-scale
-  // buckets (0,1,2,4,8,16,...) give useful resolution over the 1–64 ms range of interest.
-  if (this->partial_ref_pending_) {
-    uint32_t gap_us = loop_start_us - this->last_partial_ref_loop_start_us_;
-    this->partial_ref_loop_gap_ms_.add((gap_us + 500) / 1000);
-    this->partial_ref_pending_ = false;
-  }
   if (this->loop_count_ > 0)
     this->loop_intercall_us_.add(loop_start_us - this->last_loop_start_us_);
   this->last_loop_start_us_ = loop_start_us;
@@ -187,23 +176,18 @@ void SnifferStats::loop_start(uint32_t loop_start_us, size_t uart_available) {
     this->loop_count_++;
 }
 
-void SnifferStats::loop_end(uint32_t loop_duration_us, uint32_t frames_seen, uint32_t rx_bytes_seen,
-                            uint32_t byte_time_us) {
+void SnifferStats::loop_end(uint32_t loop_duration_us, uint32_t rx_bytes_seen, uint32_t byte_time_us) {
   if (!this->initialized_)
     return;
   this->loop_duration_us_.add(loop_duration_us);
-  this->frames_per_loop_.add(frames_seen);
   this->rx_bytes_total_ += rx_bytes_seen;
   this->rx_busy_us_ += static_cast<uint64_t>(rx_bytes_seen) * byte_time_us;
 }
 
-void SnifferStats::record_fifo_after_etx(size_t fifo_after, uint32_t correction_us) {
+void SnifferStats::record_fifo_after_etx(size_t fifo_after) {
   if (!this->initialized_)
     return;
   this->fifo_after_etx_.add(fifo_after);
-  this->dead_reckon_correction_us_.add(correction_us);
-  // Buffer for the reference-frame variant (consumed in record() if this is the ref frame).
-  this->last_fifo_after_ = fifo_after;
 }
 
 void SnifferStats::record_tx_lateness(uint32_t lateness_us) {
@@ -212,42 +196,16 @@ void SnifferStats::record_tx_lateness(uint32_t lateness_us) {
   this->tx_lateness_us_.add(lateness_us);
 }
 
-void SnifferStats::record_partial_ref_frame(const uint8_t *raw_after_stx, size_t len) {
-  if (!this->initialized_ || this->reference_frame_type_.empty())
-    return;
-  // Only count when we have enough bytes to confirm the full reference prefix is present.
-  // Partial matches (e.g. only 1 of 2 prefix bytes arrived) are not counted — there is no
-  // way to distinguish them from a different frame type that happens to share the first byte.
-  if (len < this->reference_frame_type_.size())
-    return;
-  if (std::equal(this->reference_frame_type_.begin(), this->reference_frame_type_.end(), raw_after_stx)) {
-    if (this->partial_ref_frames_ < UINT32_MAX)
-      this->partial_ref_frames_++;
-    // Arm the gap timer so the next loop_start() measures how long this split lasted.
-    // last_loop_start_us_ is the loop-start timestamp for the loop currently in progress —
-    // the gap will be (next_loop_start - last_loop_start_us_), matching the same anchor
-    // used by loop_intercall_us_ so the two distributions are directly comparable.
-    this->partial_ref_pending_ = true;
-    this->last_partial_ref_loop_start_us_ = this->last_loop_start_us_;
-  }
-}
-
-void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t loop_now_us, uint32_t frame_now_us) {
+void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t loop_now_us, size_t fifo_after) {
   if (!this->initialized_ || payload.size() < 2)
     return;
 
-  // Update the reference-frame timestamps *before* computing since-ref for this frame so
-  // that the reference frame itself shows up with no since-ref sample (its own d-ref row
-  // is always "-"), and the next non-reference frame measures from this one.
+  this->total_frames_seen_++;
+
   bool is_ref = this->matches_reference_(payload);
   if (is_ref) {
-    this->last_ref_time_ = frame_now_us;
     this->last_ref_loop_now_ = loop_now_us;
     this->ref_seen_in_period_ = true;
-    // Record UART-start and fifo-after specifically for the reference frame so these
-    // histograms show gate-frame conditions rather than the bus-wide average.
-    this->uart_available_start_ref_.add(this->last_loop_uart_available_);
-    this->fifo_after_etx_ref_.add(this->last_fifo_after_);
   }
 
   SnifferEntry *e = this->find_or_create_(payload.data());
@@ -257,35 +215,23 @@ void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t loop_now
     return;
   }
 
-  // since-same-type: only after we've seen this frame type at least once in this period.
-  if (e->count > 0) {
-    e->d_same.add((frame_now_us - e->last_seen_us + 500) / 1000);
-  }
-
-  // since-ref: skip when this frame is the reference itself (the d-ref column would be
-  // always zero and is uninformative for the reference row).
-  if (this->ref_seen_in_period_ && !is_ref) {
-    // Two cases depending on whether this frame and the reference frame were processed in
-    // the same loop() call (same-batch) or different calls (cross-batch):
-    //
-    // Same-batch (loop_now == last_ref_loop_now_): both dead-reckoned timestamps are
-    // anchored to the same loop_now, so their FIFO-age errors cancel in the subtraction.
-    // Use frame_now - last_ref_time_ for an accurate intra-batch delta.
-    //
-    // Cross-batch (loop_now != last_ref_loop_now_): using last_ref_time_ (dead-reckoned,
-    // pushed backward by the FIFO bytes that followed the reference frame) inflates d_ref
-    // by that over-estimated age. Instead subtract last_ref_loop_now_ (the raw loop start
-    // when the reference was seen), so d_ref = frame_now - last_ref_loop_now_ ≈ inter-loop
-    // gap minus the current frame's own dead-reckoning correction — an accurate measure of
-    // how long after the reference loop this frame arrived.
-    uint32_t ref_base = (loop_now_us == this->last_ref_loop_now_) ? this->last_ref_time_ : this->last_ref_loop_now_;
-    e->d_ref.add((frame_now_us - ref_base + 500) / 1000);
+  if (fifo_after > 0) {
+    // Contaminated: more frames were buffered after this one's ETX, so loop_now_us
+    // is not a reliable arrival-time estimate. Skip timing stats for this frame.
+    this->contaminated_frames_++;
+  } else {
+    // Clean frame: loop_now_us is a reliable arrival-time estimate.
+    if (e->last_seen_us != 0) {
+      e->d_same.add((loop_now_us - e->last_seen_us + 500) / 1000);
+    }
+    if (this->ref_seen_in_period_ && !is_ref) {
+      e->d_ref.add((loop_now_us - this->last_ref_loop_now_ + 500) / 1000);
+    }
+    e->last_seen_us = loop_now_us;
   }
 
   this->update_unique_payload_(*e, payload);
-
   e->count++;
-  e->last_seen_us = frame_now_us;
 }
 
 void SnifferStats::tick(uint32_t now) {
@@ -396,29 +342,16 @@ void SnifferStats::dump_processing_stats_(uint32_t now) const {
   ESP_LOGI(TAG, "  loop duration us min/mean/max: %" PRIu32 " / %" PRIu32 " / %" PRIu32,
            this->loop_duration_us_.count == 0 ? 0 : this->loop_duration_us_.min, this->loop_duration_us_.mean(),
            this->loop_duration_us_.max);
-  ESP_LOGI(TAG, "  dead-reckon correction us min/mean/max: %" PRIu32 " / %" PRIu32 " / %" PRIu32,
-           this->dead_reckon_correction_us_.count == 0 ? 0 : this->dead_reckon_correction_us_.min,
-           this->dead_reckon_correction_us_.mean(), this->dead_reckon_correction_us_.max);
   if (this->tx_lateness_us_.count > 0) {
     ESP_LOGI(TAG, "  tx_lateness_us min/mean/max: %" PRIu32 " / %" PRIu32 " / %" PRIu32 " (n=%" PRIu32 ")",
              this->tx_lateness_us_.min, this->tx_lateness_us_.mean(), this->tx_lateness_us_.max,
              this->tx_lateness_us_.count);
   }
-  ESP_LOGI(TAG,
-           "  hist uart_start bytes [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32
-           " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
-           this->uart_available_start_.buckets[0], this->uart_available_start_.buckets[1],
-           this->uart_available_start_.buckets[2], this->uart_available_start_.buckets[3],
-           this->uart_available_start_.buckets[4], this->uart_available_start_.buckets[5],
-           this->uart_available_start_.buckets[6], this->uart_available_start_.buckets[7],
-           this->uart_available_start_.buckets[8], this->uart_available_start_.buckets[9]);
-  ESP_LOGI(TAG,
-           "  hist frames_per_loop [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32
-           " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
-           this->frames_per_loop_.buckets[0], this->frames_per_loop_.buckets[1], this->frames_per_loop_.buckets[2],
-           this->frames_per_loop_.buckets[3], this->frames_per_loop_.buckets[4], this->frames_per_loop_.buckets[5],
-           this->frames_per_loop_.buckets[6], this->frames_per_loop_.buckets[7], this->frames_per_loop_.buckets[8],
-           this->frames_per_loop_.buckets[9]);
+  if (this->total_frames_seen_ > 0) {
+    uint32_t pct = this->contaminated_frames_ * 100 / this->total_frames_seen_;
+    ESP_LOGI(TAG, "  fifo_after>0 (contaminated): %" PRIu32 " / %" PRIu32 " frames (%" PRIu32 "%%)",
+             this->contaminated_frames_, this->total_frames_seen_, pct);
+  }
   ESP_LOGI(TAG,
            "  hist fifo_after_etx bytes [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32
            " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
@@ -426,39 +359,6 @@ void SnifferStats::dump_processing_stats_(uint32_t now) const {
            this->fifo_after_etx_.buckets[3], this->fifo_after_etx_.buckets[4], this->fifo_after_etx_.buckets[5],
            this->fifo_after_etx_.buckets[6], this->fifo_after_etx_.buckets[7], this->fifo_after_etx_.buckets[8],
            this->fifo_after_etx_.buckets[9]);
-  // Reference-frame-specific histograms: only printed when a reference frame type is
-  // configured. These isolate gate-frame conditions from the bus-wide aggregate, making
-  // it easy to see how "clean" the UART state is specifically when the TX window opens.
-  if (!this->reference_frame_type_.empty()) {
-    ESP_LOGI(TAG,
-             "  hist uart_start_ref bytes [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32
-             " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
-             this->uart_available_start_ref_.buckets[0], this->uart_available_start_ref_.buckets[1],
-             this->uart_available_start_ref_.buckets[2], this->uart_available_start_ref_.buckets[3],
-             this->uart_available_start_ref_.buckets[4], this->uart_available_start_ref_.buckets[5],
-             this->uart_available_start_ref_.buckets[6], this->uart_available_start_ref_.buckets[7],
-             this->uart_available_start_ref_.buckets[8], this->uart_available_start_ref_.buckets[9]);
-    ESP_LOGI(TAG,
-             "  hist fifo_after_etx_ref bytes [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32
-             " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
-             this->fifo_after_etx_ref_.buckets[0], this->fifo_after_etx_ref_.buckets[1],
-             this->fifo_after_etx_ref_.buckets[2], this->fifo_after_etx_ref_.buckets[3],
-             this->fifo_after_etx_ref_.buckets[4], this->fifo_after_etx_ref_.buckets[5],
-             this->fifo_after_etx_ref_.buckets[6], this->fifo_after_etx_ref_.buckets[7],
-             this->fifo_after_etx_ref_.buckets[8], this->fifo_after_etx_ref_.buckets[9]);
-    if (this->partial_ref_frames_ > 0) {
-      ESP_LOGI(TAG, "  ref partial loops: %" PRIu32 " (ref frame split — each is a loop-trip added to TX latency)",
-               this->partial_ref_frames_);
-      ESP_LOGI(TAG,
-               "  hist partial_ref_loop_gap ms [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32
-               " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
-               this->partial_ref_loop_gap_ms_.buckets[0], this->partial_ref_loop_gap_ms_.buckets[1],
-               this->partial_ref_loop_gap_ms_.buckets[2], this->partial_ref_loop_gap_ms_.buckets[3],
-               this->partial_ref_loop_gap_ms_.buckets[4], this->partial_ref_loop_gap_ms_.buckets[5],
-               this->partial_ref_loop_gap_ms_.buckets[6], this->partial_ref_loop_gap_ms_.buckets[7],
-               this->partial_ref_loop_gap_ms_.buckets[8], this->partial_ref_loop_gap_ms_.buckets[9]);
-    }
-  }
 }
 
 void SnifferStats::dump_payloads_(size_t top_n, const uint8_t *order) const {

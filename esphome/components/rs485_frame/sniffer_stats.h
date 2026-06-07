@@ -132,28 +132,20 @@ class SnifferStats {
   void init(size_t max_entries, uint32_t interval_ms, uint8_t payload_dump_top, size_t max_unique_payloads,
             size_t payload_capture_bytes, const std::vector<uint8_t> &reference_frame_type, bool strip_high_bit);
 
-  void loop_start(uint32_t loop_start_us, size_t uart_available);
-  void loop_end(uint32_t loop_duration_us, uint32_t frames_seen, uint32_t rx_bytes_seen, uint32_t byte_time_us);
-  void record_fifo_after_etx(size_t fifo_after, uint32_t correction_us);
+  void loop_start(uint32_t loop_start_us);
+  void loop_end(uint32_t loop_duration_us, uint32_t rx_bytes_seen, uint32_t byte_time_us);
+  void record_fifo_after_etx(size_t fifo_after);
   // Called when a deferred TX frame fires. lateness_us = micros() - tx_start_at_us_ at the
   // moment the frame is written; quantifies how much the cooperative loop delayed the send.
   void record_tx_lateness(uint32_t lateness_us);
-  // Called after read_uart_() exhausts available() while in_frame_ is still true and the
-  // accumulated raw bytes (after the DLE+STX header, so raw_after_stx[0..len-1]) match the
-  // configured reference frame type prefix. Counts loops where the reference frame was split
-  // across two or more loop() calls, requiring an extra scheduling round-trip before the gate
-  // can fire. Only fires when the full reference prefix is visible (len >= prefix length).
-  // raw_after_stx must not contain unescaped DLE bytes in the prefix region — assumed safe
-  // because frame type values are protocol-defined identifiers that never equal 0x10 (DLE) in
-  // any known bus implementation.
-  void record_partial_ref_frame(const uint8_t *raw_after_stx, size_t len);
 
   // Hot path. Called once per validated RX frame with the payload-relative bytes (frame
   // type at payload[0..N-1], data after). Returns immediately if init() was never called.
-  // loop_now_us  — micros() sampled at the top of this component loop.
-  // frame_now_us — dead-reckoned ETX timestamp from micros() at ETX processing minus the
-  //                UART bytes still buffered after the frame.
-  void record(const std::vector<uint8_t> &payload, uint32_t loop_now_us, uint32_t frame_now_us);
+  // loop_now_us — micros() sampled at the top of this component loop.
+  // fifo_after  — bytes remaining in UART FIFO after the frame's ETX was detected; non-zero
+  //               means the timestamp is unreliable (frame was batched with others) and
+  //               timing stats are excluded for this frame.
+  void record(const std::vector<uint8_t> &payload, uint32_t loop_now_us, size_t fifo_after);
 
   // Called from the hub's loop(). Emits the table if interval_ms has elapsed since the
   // last dump, then resets per-period counters.
@@ -176,46 +168,20 @@ class SnifferStats {
 
   FixedVector<SnifferEntry> entries_;
   StaticVector<uint8_t, SNIFFER_REFERENCE_MAX_LEN> reference_frame_type_;
-  // Dead-reckoned micros() timestamp of the most recent reference frame.
-  uint32_t last_ref_time_{0};
-  // Raw loop-start micros() when the most recent reference frame was processed. Used for
-  // cross-batch d_ref: subtracting a raw loop timestamp from a dead-reckoned frame_now
-  // correctly measures the inter-loop gap minus the current frame's FIFO age, rather than
-  // inflating d_ref by the reference frame's over-estimated FIFO age.
+  // loop_start micros() when the most recent reference frame was processed, used as the
+  // anchor for d_ref on subsequent clean frames in other loop iterations.
   uint32_t last_ref_loop_now_{0};
   bool ref_seen_in_period_{false};
   uint32_t interval_ms_{0};
   uint32_t last_dump_time_{0};
   uint32_t dropped_frame_types_{0};
-  SnifferHistogram uart_available_start_;
-  SnifferHistogram frames_per_loop_;
   SnifferHistogram fifo_after_etx_;
-  // Reference-frame-specific variants of the above two histograms. Each sample is recorded
-  // only for the loop/ETX event that produced the reference frame, so these show the UART
-  // and FIFO state specifically when the gate frame arrives — not the bus-wide aggregate.
-  // Only populated when reference_frame_type_ is non-empty.
-  SnifferHistogram uart_available_start_ref_;
-  SnifferHistogram fifo_after_etx_ref_;
-  // Loop-to-loop gap histogram (in ms) measured from the loop that exited with a partial
-  // reference frame to the immediately following loop_start(). Answers: "when the gate
-  // frame is split across loops, how quickly does the next loop arrive?" If these gaps
-  // cluster in the 1-4ms range the split self-resolves fast; if they track the ~14ms mean
-  // loop gap then every split frame delays the TX window by a full cycle.
-  SnifferHistogram partial_ref_loop_gap_ms_;
-  // Buffered values to correlate loop-start UART available and fifo_after with the frame
-  // type (known only when record() is called, after record_fifo_after_etx).
-  size_t last_loop_uart_available_{0};
-  size_t last_fifo_after_{0};
-  // Set by record_partial_ref_frame() and cleared by the next loop_start() after measuring
-  // the gap. Guards against counting a gap more than once per split event.
-  bool partial_ref_pending_{false};
-  uint32_t last_partial_ref_loop_start_us_{0};
-  // Lifetime count of read_uart_() exits where the partial raw frame prefix matched the
-  // reference frame type — each one is a loop() round-trip added to TX scheduling latency.
-  uint32_t partial_ref_frames_{0};
+  // Lifetime counts for contamination reporting. A frame is contaminated when fifo_after > 0
+  // at its ETX, meaning it was batched with other frames and loop_now_us is unreliable.
+  uint32_t contaminated_frames_{0};
+  uint32_t total_frames_seen_{0};
   SnifferTimingStats loop_intercall_us_;
   SnifferTimingStats loop_duration_us_;
-  SnifferTimingStats dead_reckon_correction_us_;
   SnifferTimingStats tx_lateness_us_;
   uint32_t last_loop_start_us_{0};
   uint32_t loop_count_{0};
