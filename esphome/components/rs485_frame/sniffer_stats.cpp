@@ -216,9 +216,9 @@ void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t loop_now
   }
 
   if (fifo_after > 0) {
-    // Contaminated: more frames were buffered after this one's ETX, so loop_now_us
-    // is not a reliable arrival-time estimate. Skip timing stats for this frame.
-    this->contaminated_frames_++;
+    // Batched: more frames were buffered after this one's ETX, so loop_now_us is not a
+    // reliable per-frame arrival-time estimate. Skip timing stats for this frame.
+    this->batched_frames_++;
   } else {
     // Clean frame: loop_now_us is a reliable arrival-time estimate.
     if (e->last_seen_us != 0) {
@@ -348,9 +348,9 @@ void SnifferStats::dump_processing_stats_(uint32_t now) const {
              this->tx_lateness_us_.count);
   }
   if (this->total_frames_seen_ > 0) {
-    uint32_t pct = this->contaminated_frames_ * 100 / this->total_frames_seen_;
-    ESP_LOGI(TAG, "  fifo_after>0 (contaminated): %" PRIu32 " / %" PRIu32 " frames (%" PRIu32 "%%)",
-             this->contaminated_frames_, this->total_frames_seen_, pct);
+    uint32_t pct = this->batched_frames_ * 100 / this->total_frames_seen_;
+    ESP_LOGI(TAG, "  batched frames (fifo_after>0, timing excluded): %" PRIu32 " / %" PRIu32 " (%" PRIu32 "%%)",
+             this->batched_frames_, this->total_frames_seen_, pct);
   }
   ESP_LOGI(TAG,
            "  hist fifo_after_etx bytes [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32

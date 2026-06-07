@@ -176,9 +176,10 @@ class SnifferStats {
   uint32_t last_dump_time_{0};
   uint32_t dropped_frame_types_{0};
   SnifferHistogram fifo_after_etx_;
-  // Lifetime counts for contamination reporting. A frame is contaminated when fifo_after > 0
-  // at its ETX, meaning it was batched with other frames and loop_now_us is unreliable.
-  uint32_t contaminated_frames_{0};
+  // Lifetime counts for batch reporting. A frame is batched when fifo_after > 0 at its ETX,
+  // meaning it arrived with other frames in the same read window; loop_now_us is unreliable
+  // for per-frame timing, so d_ref/d_same are not sampled for these frames.
+  uint32_t batched_frames_{0};
   uint32_t total_frames_seen_{0};
   SnifferTimingStats loop_intercall_us_;
   SnifferTimingStats loop_duration_us_;
