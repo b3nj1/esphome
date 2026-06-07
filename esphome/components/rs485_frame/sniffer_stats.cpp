@@ -172,6 +172,14 @@ void SnifferStats::loop_start(uint32_t loop_start_us, size_t uart_available) {
   this->uart_available_start_.add(uart_available);
   // Buffer for the reference-frame histogram (consumed in record() if a ref frame is seen).
   this->last_loop_uart_available_ = uart_available;
+  // If the previous loop exited mid-reference-frame, measure how long it took to get back.
+  // The gap is in microseconds; convert to ms (rounded) for the histogram so the log-scale
+  // buckets (0,1,2,4,8,16,...) give useful resolution over the 1–64 ms range of interest.
+  if (this->partial_ref_pending_) {
+    uint32_t gap_us = loop_start_us - this->last_partial_ref_loop_start_us_;
+    this->partial_ref_loop_gap_ms_.add((gap_us + 500) / 1000);
+    this->partial_ref_pending_ = false;
+  }
   if (this->loop_count_ > 0)
     this->loop_intercall_us_.add(loop_start_us - this->last_loop_start_us_);
   this->last_loop_start_us_ = loop_start_us;
@@ -215,6 +223,12 @@ void SnifferStats::record_partial_ref_frame(const uint8_t *raw_after_stx, size_t
   if (std::equal(this->reference_frame_type_.begin(), this->reference_frame_type_.end(), raw_after_stx)) {
     if (this->partial_ref_frames_ < UINT32_MAX)
       this->partial_ref_frames_++;
+    // Arm the gap timer so the next loop_start() measures how long this split lasted.
+    // last_loop_start_us_ is the loop-start timestamp for the loop currently in progress —
+    // the gap will be (next_loop_start - last_loop_start_us_), matching the same anchor
+    // used by loop_intercall_us_ so the two distributions are directly comparable.
+    this->partial_ref_pending_ = true;
+    this->last_partial_ref_loop_start_us_ = this->last_loop_start_us_;
   }
 }
 
@@ -432,9 +446,18 @@ void SnifferStats::dump_processing_stats_(uint32_t now) const {
              this->fifo_after_etx_ref_.buckets[4], this->fifo_after_etx_ref_.buckets[5],
              this->fifo_after_etx_ref_.buckets[6], this->fifo_after_etx_ref_.buckets[7],
              this->fifo_after_etx_ref_.buckets[8], this->fifo_after_etx_ref_.buckets[9]);
-    if (this->partial_ref_frames_ > 0)
+    if (this->partial_ref_frames_ > 0) {
       ESP_LOGI(TAG, "  ref partial loops: %" PRIu32 " (ref frame split — each is a loop-trip added to TX latency)",
                this->partial_ref_frames_);
+      ESP_LOGI(TAG,
+               "  hist partial_ref_loop_gap ms [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32
+               " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
+               this->partial_ref_loop_gap_ms_.buckets[0], this->partial_ref_loop_gap_ms_.buckets[1],
+               this->partial_ref_loop_gap_ms_.buckets[2], this->partial_ref_loop_gap_ms_.buckets[3],
+               this->partial_ref_loop_gap_ms_.buckets[4], this->partial_ref_loop_gap_ms_.buckets[5],
+               this->partial_ref_loop_gap_ms_.buckets[6], this->partial_ref_loop_gap_ms_.buckets[7],
+               this->partial_ref_loop_gap_ms_.buckets[8], this->partial_ref_loop_gap_ms_.buckets[9]);
+    }
   }
 }
 

@@ -196,10 +196,20 @@ class SnifferStats {
   // Only populated when reference_frame_type_ is non-empty.
   SnifferHistogram uart_available_start_ref_;
   SnifferHistogram fifo_after_etx_ref_;
+  // Loop-to-loop gap histogram (in ms) measured from the loop that exited with a partial
+  // reference frame to the immediately following loop_start(). Answers: "when the gate
+  // frame is split across loops, how quickly does the next loop arrive?" If these gaps
+  // cluster in the 1-4ms range the split self-resolves fast; if they track the ~14ms mean
+  // loop gap then every split frame delays the TX window by a full cycle.
+  SnifferHistogram partial_ref_loop_gap_ms_;
   // Buffered values to correlate loop-start UART available and fifo_after with the frame
   // type (known only when record() is called, after record_fifo_after_etx).
   size_t last_loop_uart_available_{0};
   size_t last_fifo_after_{0};
+  // Set by record_partial_ref_frame() and cleared by the next loop_start() after measuring
+  // the gap. Guards against counting a gap more than once per split event.
+  bool partial_ref_pending_{false};
+  uint32_t last_partial_ref_loop_start_us_{0};
   // Lifetime count of read_uart_() exits where the partial raw frame prefix matched the
   // reference frame type — each one is a loop() round-trip added to TX scheduling latency.
   uint32_t partial_ref_frames_{0};
