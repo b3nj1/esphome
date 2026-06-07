@@ -138,6 +138,15 @@ class SnifferStats {
   // Called when a deferred TX frame fires. lateness_us = micros() - tx_start_at_us_ at the
   // moment the frame is written; quantifies how much the cooperative loop delayed the send.
   void record_tx_lateness(uint32_t lateness_us);
+  // Called after read_uart_() exhausts available() while in_frame_ is still true and the
+  // accumulated raw bytes (after the DLE+STX header, so raw_after_stx[0..len-1]) match the
+  // configured reference frame type prefix. Counts loops where the reference frame was split
+  // across two or more loop() calls, requiring an extra scheduling round-trip before the gate
+  // can fire. Only fires when the full reference prefix is visible (len >= prefix length).
+  // raw_after_stx must not contain unescaped DLE bytes in the prefix region — assumed safe
+  // because frame type values are protocol-defined identifiers that never equal 0x10 (DLE) in
+  // any known bus implementation.
+  void record_partial_ref_frame(const uint8_t *raw_after_stx, size_t len);
 
   // Hot path. Called once per validated RX frame with the payload-relative bytes (frame
   // type at payload[0..N-1], data after). Returns immediately if init() was never called.
@@ -181,6 +190,19 @@ class SnifferStats {
   SnifferHistogram uart_available_start_;
   SnifferHistogram frames_per_loop_;
   SnifferHistogram fifo_after_etx_;
+  // Reference-frame-specific variants of the above two histograms. Each sample is recorded
+  // only for the loop/ETX event that produced the reference frame, so these show the UART
+  // and FIFO state specifically when the gate frame arrives — not the bus-wide aggregate.
+  // Only populated when reference_frame_type_ is non-empty.
+  SnifferHistogram uart_available_start_ref_;
+  SnifferHistogram fifo_after_etx_ref_;
+  // Buffered values to correlate loop-start UART available and fifo_after with the frame
+  // type (known only when record() is called, after record_fifo_after_etx).
+  size_t last_loop_uart_available_{0};
+  size_t last_fifo_after_{0};
+  // Lifetime count of read_uart_() exits where the partial raw frame prefix matched the
+  // reference frame type — each one is a loop() round-trip added to TX scheduling latency.
+  uint32_t partial_ref_frames_{0};
   SnifferTimingStats loop_intercall_us_;
   SnifferTimingStats loop_duration_us_;
   SnifferTimingStats dead_reckon_correction_us_;

@@ -170,6 +170,8 @@ void SnifferStats::loop_start(uint32_t loop_start_us, size_t uart_available) {
   if (!this->initialized_)
     return;
   this->uart_available_start_.add(uart_available);
+  // Buffer for the reference-frame histogram (consumed in record() if a ref frame is seen).
+  this->last_loop_uart_available_ = uart_available;
   if (this->loop_count_ > 0)
     this->loop_intercall_us_.add(loop_start_us - this->last_loop_start_us_);
   this->last_loop_start_us_ = loop_start_us;
@@ -192,12 +194,28 @@ void SnifferStats::record_fifo_after_etx(size_t fifo_after, uint32_t correction_
     return;
   this->fifo_after_etx_.add(fifo_after);
   this->dead_reckon_correction_us_.add(correction_us);
+  // Buffer for the reference-frame variant (consumed in record() if this is the ref frame).
+  this->last_fifo_after_ = fifo_after;
 }
 
 void SnifferStats::record_tx_lateness(uint32_t lateness_us) {
   if (!this->initialized_)
     return;
   this->tx_lateness_us_.add(lateness_us);
+}
+
+void SnifferStats::record_partial_ref_frame(const uint8_t *raw_after_stx, size_t len) {
+  if (!this->initialized_ || this->reference_frame_type_.empty())
+    return;
+  // Only count when we have enough bytes to confirm the full reference prefix is present.
+  // Partial matches (e.g. only 1 of 2 prefix bytes arrived) are not counted — there is no
+  // way to distinguish them from a different frame type that happens to share the first byte.
+  if (len < this->reference_frame_type_.size())
+    return;
+  if (std::equal(this->reference_frame_type_.begin(), this->reference_frame_type_.end(), raw_after_stx)) {
+    if (this->partial_ref_frames_ < UINT32_MAX)
+      this->partial_ref_frames_++;
+  }
 }
 
 void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t loop_now_us, uint32_t frame_now_us) {
@@ -212,6 +230,10 @@ void SnifferStats::record(const std::vector<uint8_t> &payload, uint32_t loop_now
     this->last_ref_time_ = frame_now_us;
     this->last_ref_loop_now_ = loop_now_us;
     this->ref_seen_in_period_ = true;
+    // Record UART-start and fifo-after specifically for the reference frame so these
+    // histograms show gate-frame conditions rather than the bus-wide average.
+    this->uart_available_start_ref_.add(this->last_loop_uart_available_);
+    this->fifo_after_etx_ref_.add(this->last_fifo_after_);
   }
 
   SnifferEntry *e = this->find_or_create_(payload.data());
@@ -390,6 +412,30 @@ void SnifferStats::dump_processing_stats_(uint32_t now) const {
            this->fifo_after_etx_.buckets[3], this->fifo_after_etx_.buckets[4], this->fifo_after_etx_.buckets[5],
            this->fifo_after_etx_.buckets[6], this->fifo_after_etx_.buckets[7], this->fifo_after_etx_.buckets[8],
            this->fifo_after_etx_.buckets[9]);
+  // Reference-frame-specific histograms: only printed when a reference frame type is
+  // configured. These isolate gate-frame conditions from the bus-wide aggregate, making
+  // it easy to see how "clean" the UART state is specifically when the TX window opens.
+  if (!this->reference_frame_type_.empty()) {
+    ESP_LOGI(TAG,
+             "  hist uart_start_ref bytes [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32
+             " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
+             this->uart_available_start_ref_.buckets[0], this->uart_available_start_ref_.buckets[1],
+             this->uart_available_start_ref_.buckets[2], this->uart_available_start_ref_.buckets[3],
+             this->uart_available_start_ref_.buckets[4], this->uart_available_start_ref_.buckets[5],
+             this->uart_available_start_ref_.buckets[6], this->uart_available_start_ref_.buckets[7],
+             this->uart_available_start_ref_.buckets[8], this->uart_available_start_ref_.buckets[9]);
+    ESP_LOGI(TAG,
+             "  hist fifo_after_etx_ref bytes [0,1,2,4,8,16,32,64,128,>128]: %" PRIu32 " %" PRIu32 " %" PRIu32
+             " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
+             this->fifo_after_etx_ref_.buckets[0], this->fifo_after_etx_ref_.buckets[1],
+             this->fifo_after_etx_ref_.buckets[2], this->fifo_after_etx_ref_.buckets[3],
+             this->fifo_after_etx_ref_.buckets[4], this->fifo_after_etx_ref_.buckets[5],
+             this->fifo_after_etx_ref_.buckets[6], this->fifo_after_etx_ref_.buckets[7],
+             this->fifo_after_etx_ref_.buckets[8], this->fifo_after_etx_ref_.buckets[9]);
+    if (this->partial_ref_frames_ > 0)
+      ESP_LOGI(TAG, "  ref partial loops: %" PRIu32 " (ref frame split — each is a loop-trip added to TX latency)",
+               this->partial_ref_frames_);
+  }
 }
 
 void SnifferStats::dump_payloads_(size_t top_n, const uint8_t *order) const {

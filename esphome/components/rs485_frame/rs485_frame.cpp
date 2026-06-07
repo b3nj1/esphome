@@ -353,6 +353,16 @@ void RS485FrameHub::read_uart_(uint32_t now) {
     // spuriously start a new frame.
     this->previous_byte_ = byte;
   }
+#ifdef USE_RS485_FRAME_SNIFFER_STATS
+  // If we exited mid-frame, check whether the partial frame matches the reference type.
+  // raw_frame_ layout: [0]=DLE [1]=STX [2..N]=payload bytes so far. We skip past the
+  // DLE+STX header and compare the payload prefix against the reference frame type.
+  // Each such event is a full loop() round-trip added to TX scheduling latency; the
+  // counter lets users see whether the gate frame is reliably arriving in a single loop
+  // or is routinely split across two or more calls.
+  if (this->sniffer_stats_ != nullptr && this->in_frame_ && this->raw_frame_.size() > 2)
+    this->sniffer_stats_->record_partial_ref_frame(this->raw_frame_.data() + 2, this->raw_frame_.size() - 2);
+#endif
 }
 
 void RS485FrameHub::process_raw_frame_(uint32_t now) {
